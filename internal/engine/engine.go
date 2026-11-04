@@ -24,6 +24,8 @@ import (
 	"github.com/shostwp-byte/da-resourcelimiter/internal/version"
 )
 
+const DefaultAsyncSyncThreshold = 20
+
 // UpdaterProvider abstracts GitHub Releases operations implemented in Phase 4.
 type UpdaterProvider interface {
 	GetStatus(ctx context.Context) (ipc.UpdaterStatusData, error)
@@ -34,19 +36,21 @@ type UpdaterProvider interface {
 
 // Engine coordinates Cgroups v2, PHP-FPM classification, MariaDB Governor, Violation Logs, and IPC requests.
 type Engine struct {
-	StartedAt     time.Time
-	Store         *config.Store
-	Registry      *dausers.Registry
-	CgroupMgr     *cgroup.Manager
-	Classifier    *fpm.Classifier
-	MySQLGov      *mysqlgov.Governor
-	Logger        *logger.ViolationLogger
-	Updater       UpdaterProvider
-	DADataRoot    string // Default: /usr/local/directadmin/data
-	DAUsersDir    string // Default: /usr/local/directadmin/data/users
-	PasswdPath    string // Default: /etc/passwd
-	DiradminUID   uint32
+	StartedAt          time.Time
+	Store              *config.Store
+	Registry           *dausers.Registry
+	CgroupMgr          *cgroup.Manager
+	Classifier         *fpm.Classifier
+	MySQLGov           *mysqlgov.Governor
+	Logger             *logger.ViolationLogger
+	Updater            UpdaterProvider
+	DADataRoot         string // Default: /usr/local/directadmin/data
+	DAUsersDir         string // Default: /usr/local/directadmin/data/users
+	PasswdPath         string // Default: /etc/passwd
+	DiradminUID        uint32
+	AsyncSyncThreshold int
 
+	applyMu     sync.Mutex
 	oomMu       sync.Mutex
 	oomBaseline map[uint32]uint64
 }
@@ -68,19 +72,49 @@ func New(
 		passwdPath = "/etc/passwd"
 	}
 	return &Engine{
-		StartedAt:   time.Now(),
-		Store:       store,
-		Registry:    reg,
-		CgroupMgr:   cgMgr,
-		Classifier:  cls,
-		MySQLGov:    mysqlGov,
-		Logger:      vlog,
-		DADataRoot:  daDataRoot,
-		DAUsersDir:  filepath.Join(daDataRoot, "users"),
-		PasswdPath:  passwdPath,
-		DiradminUID: lookupUserUID(passwdPath, "diradmin"),
-		oomBaseline: make(map[uint32]uint64),
+		StartedAt:          time.Now(),
+		Store:              store,
+		Registry:           reg,
+		CgroupMgr:          cgMgr,
+		Classifier:         cls,
+		MySQLGov:           mysqlGov,
+		Logger:             vlog,
+		DADataRoot:         daDataRoot,
+		DAUsersDir:         filepath.Join(daDataRoot, "users"),
+		PasswdPath:         passwdPath,
+		DiradminUID:        lookupUserUID(passwdPath, "diradmin"),
+		AsyncSyncThreshold: DefaultAsyncSyncThreshold,
+		oomBaseline:        make(map[uint32]uint64),
 	}
+}
+
+// AuthorizeSocketPeer implements ipc.PeerAuthorizer so unauthorized UIDs are rejected before reading JSON.
+func (e *Engine) AuthorizeSocketPeer(peerUID uint32, isAdminSocket bool) error {
+	if isAdminSocket {
+		if _, ok := e.IsAuthorizedAdminUID(peerUID); !ok {
+			return fmt.Errorf("permission denied: caller UID %d is not a DirectAdmin administrator", peerUID)
+		}
+		return nil
+	}
+	if _, ok := e.IsAuthorizedAdminUID(peerUID); ok {
+		return nil
+	}
+	if _, ok := e.Registry.LookupByUID(peerUID); ok {
+		return nil
+	}
+	return errors.New("caller UID is not a managed DirectAdmin hosting account")
+}
+
+// IsRootOrDiradminUID restricts root-equivalent operations (self-updater config, update, rollback)
+// strictly to UID 0 (root) or the system diradmin daemon UID, blocking secondary DA admins.
+func (e *Engine) IsRootOrDiradminUID(peerUID uint32) bool {
+	if peerUID == 0 {
+		return true
+	}
+	if e.DiradminUID > 0 && peerUID == e.DiradminUID {
+		return true
+	}
+	return lookupUsernameByUID(e.PasswdPath, peerUID) == "diradmin"
 }
 
 // ApplyUser applies OS Cgroups v2 slice, DirectAdmin PHP tokens, PHP PID migration, and MariaDB Tier-2 limits.
@@ -88,8 +122,16 @@ func (e *Engine) ApplyUser(ctx context.Context, username string) error {
 	if err := config.ValidateIdentifier(username); err != nil {
 		return err
 	}
-	// Always reload registry so recent package changes or newly created users in DirectAdmin take effect immediately
-	_ = e.Registry.Reload()
+	e.applyMu.Lock()
+	defer e.applyMu.Unlock()
+
+	return e.applyUserLocked(ctx, username, true)
+}
+
+func (e *Engine) applyUserLocked(ctx context.Context, username string, reloadRegistry bool) error {
+	if reloadRegistry {
+		_ = e.Registry.Reload()
+	}
 	acct, ok := e.Registry.LookupByName(username)
 	if !ok {
 		return fmt.Errorf("DirectAdmin hosting user %q not found", username)
@@ -100,7 +142,7 @@ func (e *Engine) ApplyUser(ctx context.Context, username string) error {
 		return err
 	}
 
-	if err := e.CgroupMgr.ApplyUserSlice(ctx, acct.UID, limits); err != nil {
+	if err := e.CgroupMgr.ApplyUserSliceForAccount(ctx, acct.Username, acct.UID, limits); err != nil {
 		return fmt.Errorf("apply cgroup slice: %w", err)
 	}
 	if err := fpm.SyncDAUserPHPConf(e.DAUsersDir, acct.Username, limits); err != nil {
@@ -117,11 +159,15 @@ func (e *Engine) ApplyUser(ctx context.Context, username string) error {
 	return nil
 }
 
-// ApplyAll batch-synchronizes Cgroups v2 slices, PHP tokens, and MariaDB limits for all DirectAdmin users.
+// ApplyAll batch-synchronizes Cgroups v2 slices, PHP tokens, and batched MariaDB limits for all DirectAdmin users.
 func (e *Engine) ApplyAll(ctx context.Context) error {
+	e.applyMu.Lock()
+	defer e.applyMu.Unlock()
+
 	accounts := e.Registry.All()
 	anySliceChanged := false
 	var enabledAccounts []dausers.Account
+	mysqlBatch := make(map[string]config.ResourceLimits, len(accounts))
 
 	for _, acct := range accounts {
 		limits, err := e.Store.ResolveUserLimits(acct.Username, acct.Package)
@@ -129,7 +175,7 @@ func (e *Engine) ApplyAll(ctx context.Context) error {
 			log.Printf("skip %s: resolve limits error: %v", acct.Username, err)
 			continue
 		}
-		changed, err := e.CgroupMgr.StageUserSlice(acct.UID, limits)
+		changed, err := e.CgroupMgr.StageUserSliceForAccount(acct.Username, acct.UID, limits)
 		if err != nil {
 			log.Printf("skip %s (uid %d): stage slice error: %v", acct.Username, acct.UID, err)
 			continue
@@ -140,11 +186,15 @@ func (e *Engine) ApplyAll(ctx context.Context) error {
 		if limits.Enabled {
 			enabledAccounts = append(enabledAccounts, acct)
 		}
-		_ = fpm.SyncDAUserPHPConf(e.DAUsersDir, acct.Username, limits)
-		if e.MySQLGov != nil {
-			if err := e.MySQLGov.ApplyUserAccountLimits(ctx, acct.Username, limits); err != nil {
-				log.Printf("warning: MariaDB limits for %s: %v", acct.Username, err)
-			}
+		if err := fpm.SyncDAUserPHPConf(e.DAUsersDir, acct.Username, limits); err != nil {
+			log.Printf("warning: sync PHP user.conf for %s: %v", acct.Username, err)
+		}
+		mysqlBatch[acct.Username] = limits
+	}
+
+	if e.MySQLGov != nil && len(mysqlBatch) > 0 {
+		if err := e.MySQLGov.ApplyBatchUserLimits(ctx, mysqlBatch); err != nil {
+			log.Printf("warning: batched MariaDB limits sync: %v", err)
 		}
 	}
 
@@ -159,6 +209,13 @@ func (e *Engine) ApplyAll(ctx context.Context) error {
 			log.Printf("ensure slice %s (uid %d): %v", acct.Username, acct.UID, err)
 		}
 	}
+
+	if pruned, err := e.CgroupMgr.PruneOrphanSlices(ctx, e.Registry.ActiveUIDSet(), ""); err != nil {
+		log.Printf("warning: prune orphan slices: %v", err)
+	} else if pruned > 0 {
+		log.Printf("pruned %d orphaned user-*.slice drop-in(s)", pruned)
+	}
+
 	return nil
 }
 
@@ -167,14 +224,16 @@ func (e *Engine) ApplyPackage(ctx context.Context, packageName string) (int, err
 	if err := config.ValidateIdentifier(packageName); err != nil {
 		return 0, err
 	}
+	e.applyMu.Lock()
+	defer e.applyMu.Unlock()
+
 	_ = e.Registry.Reload()
 
-	synced := 0
+	var targets []dausers.Account
 	for _, acct := range e.Registry.All() {
 		if acct.Package != packageName {
 			continue
 		}
-		// Respect explicit per-user overrides
 		if userConfPath, err := e.Store.UserConfPath(acct.Username); err == nil {
 			if kv, err := config.ParseKeyValueFile(userConfPath); err == nil {
 				if strings.EqualFold(kv["CUSTOM_OVERRIDE"], "yes") || strings.EqualFold(kv["CUSTOM_OVERRIDE"], "true") {
@@ -182,16 +241,57 @@ func (e *Engine) ApplyPackage(ctx context.Context, packageName string) (int, err
 				}
 			}
 		}
-		if err := e.ApplyUser(ctx, acct.Username); err != nil {
-			log.Printf("apply package %s -> user %s error: %v", packageName, acct.Username, err)
+		targets = append(targets, acct)
+	}
+
+	anySliceChanged := false
+	var enabledTargets []dausers.Account
+	mysqlBatch := make(map[string]config.ResourceLimits, len(targets))
+	synced := 0
+
+	for _, acct := range targets {
+		limits, err := e.Store.ResolveUserLimits(acct.Username, acct.Package)
+		if err != nil {
+			log.Printf("apply package %s -> user %s resolve error: %v", packageName, acct.Username, err)
 			continue
 		}
+		changed, err := e.CgroupMgr.StageUserSliceForAccount(acct.Username, acct.UID, limits)
+		if err != nil {
+			log.Printf("apply package %s -> user %s stage error: %v", packageName, acct.Username, err)
+			continue
+		}
+		if changed {
+			anySliceChanged = true
+		}
+		if limits.Enabled {
+			enabledTargets = append(enabledTargets, acct)
+		}
+		_ = fpm.SyncDAUserPHPConf(e.DAUsersDir, acct.Username, limits)
+		mysqlBatch[acct.Username] = limits
 		synced++
 	}
+
+	if e.MySQLGov != nil && len(mysqlBatch) > 0 {
+		if err := e.MySQLGov.ApplyBatchUserLimits(ctx, mysqlBatch); err != nil {
+			log.Printf("warning: package %s MariaDB batch sync: %v", packageName, err)
+		}
+	}
+	if anySliceChanged {
+		if err := e.CgroupMgr.ReloadSystemd(ctx); err != nil {
+			return synced, err
+		}
+	}
+	for _, acct := range enabledTargets {
+		_ = e.CgroupMgr.EnsureSliceAndPHPScope(ctx, acct.UID)
+		if e.Classifier != nil {
+			_, _ = e.Classifier.ScanOnce(ctx, acct.UID)
+		}
+	}
+
 	return synced, nil
 }
 
-// ApplyNewDBUser immediately enforces Tier-2 MariaDB limits on a newly created database user.
+// ApplyNewDBUser immediately enforces Tier-2 MariaDB limits on a newly created database user owned by daUsername.
 func (e *Engine) ApplyNewDBUser(ctx context.Context, daUsername, dbUser string) error {
 	if err := config.ValidateIdentifier(daUsername); err != nil {
 		return err
@@ -200,28 +300,37 @@ func (e *Engine) ApplyNewDBUser(ctx context.Context, daUsername, dbUser string) 
 		return nil
 	}
 	_ = e.Registry.Reload()
-	pkg := ""
-	if acct, ok := e.Registry.LookupByName(daUsername); ok {
-		pkg = acct.Package
+	acct, ok := e.Registry.LookupByName(daUsername)
+	if !ok {
+		return fmt.Errorf("DirectAdmin hosting user %q not found", daUsername)
 	}
-	limits, err := e.Store.ResolveUserLimits(daUsername, pkg)
+	limits, err := e.Store.ResolveUserLimits(acct.Username, acct.Package)
 	if err != nil {
 		return err
 	}
-	return e.MySQLGov.ApplySingleDBUserLimits(ctx, dbUser, limits)
+	return e.MySQLGov.ApplySingleOwnedDBUserLimits(ctx, acct.Username, dbUser, limits)
 }
 
-// RemoveUser cleans up slice drop-in files, resets MariaDB limits, and deletes custom user config.
+// RemoveUser cleans up slice drop-in files (including post-deletion orphans), resets MariaDB limits, and deletes custom user config.
 func (e *Engine) RemoveUser(ctx context.Context, username string) error {
 	if err := config.ValidateIdentifier(username); err != nil {
 		return err
 	}
+	e.applyMu.Lock()
+	defer e.applyMu.Unlock()
+
 	if acct, ok := e.Registry.LookupByName(username); ok {
 		_ = e.CgroupMgr.RemoveUserSlice(ctx, acct.UID)
 		e.oomMu.Lock()
 		delete(e.oomBaseline, acct.UID)
 		e.oomMu.Unlock()
 	}
+
+	_ = e.Registry.Reload()
+	if _, err := e.CgroupMgr.PruneOrphanSlices(ctx, e.Registry.ActiveUIDSet(), username); err != nil {
+		log.Printf("warning: prune orphan slice for removed user %s: %v", username, err)
+	}
+
 	if e.MySQLGov != nil {
 		_ = e.MySQLGov.UnblockUser(ctx, username)
 		_ = e.MySQLGov.RemoveUserAccountLimits(ctx, username)
@@ -229,8 +338,49 @@ func (e *Engine) RemoveUser(ctx context.Context, username string) error {
 	if err := e.Store.DeleteUserLimits(username); err != nil {
 		return err
 	}
-	_ = e.Registry.Reload()
 	return nil
+}
+
+// PruneOrphans scans /etc/systemd/system/user-*.slice.d/50-da-limits.conf and deletes drop-ins
+// whose UID is no longer an active DirectAdmin hosting account.
+func (e *Engine) PruneOrphans(ctx context.Context) {
+	e.applyMu.Lock()
+	defer e.applyMu.Unlock()
+
+	validUIDs := e.Registry.ActiveUIDSet()
+	e.oomMu.Lock()
+	for uid := range e.oomBaseline {
+		if _, ok := validUIDs[uid]; !ok {
+			delete(e.oomBaseline, uid)
+		}
+	}
+	e.oomMu.Unlock()
+
+	if pruned, err := e.CgroupMgr.PruneOrphanSlices(ctx, validUIDs, ""); err != nil {
+		log.Printf("warning: periodic orphan slice prune failed: %v", err)
+	} else if pruned > 0 {
+		log.Printf("pruned %d orphaned user-*.slice drop-in(s)", pruned)
+	}
+}
+
+func (e *Engine) runBackgroundSync(label string, fn func(context.Context) error) {
+	go func() {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		if err := fn(bgCtx); err != nil {
+			log.Printf("background sync (%s) error: %v", label, err)
+		}
+	}()
+}
+
+func (e *Engine) countPackageUsers(packageName string) int {
+	n := 0
+	for _, acct := range e.Registry.All() {
+		if acct.Package == packageName {
+			n++
+		}
+	}
+	return n
 }
 
 // CheckOOMEvents polls Cgroups v2 memory.events counters and logs any newly occurred Kernel OOM Kills.
@@ -388,7 +538,14 @@ func (e *Engine) HandleAdminRequest(ctx context.Context, peerUID uint32, req ipc
 			return ipc.Response{OK: false, Error: err.Error()}
 		}
 		if req.SyncUsers {
-			_ = e.ApplyAll(ctx)
+			total := e.Registry.Count()
+			if e.AsyncSyncThreshold > 0 && total > e.AsyncSyncThreshold {
+				e.runBackgroundSync("default-limits", e.ApplyAll)
+				return ipc.Response{OK: true, Message: fmt.Sprintf("saved default limits (background sync started for %d users)", total)}
+			}
+			if err := e.ApplyAll(ctx); err != nil {
+				return ipc.Response{OK: false, Error: err.Error()}
+			}
 		}
 		return ipc.Response{OK: true, Message: "saved default limits"}
 
@@ -399,15 +556,23 @@ func (e *Engine) HandleAdminRequest(ctx context.Context, peerUID uint32, req ipc
 		if err := e.Store.SavePackageLimits(req.Package, *req.Limits); err != nil {
 			return ipc.Response{OK: false, Error: err.Error()}
 		}
-		synced := 0
 		if req.SyncUsers {
-			var err error
-			synced, err = e.ApplyPackage(ctx, req.Package)
+			pkgCount := e.countPackageUsers(req.Package)
+			if e.AsyncSyncThreshold > 0 && pkgCount > e.AsyncSyncThreshold {
+				pkg := req.Package
+				e.runBackgroundSync("package:"+pkg, func(bgCtx context.Context) error {
+					_, err := e.ApplyPackage(bgCtx, pkg)
+					return err
+				})
+				return ipc.Response{OK: true, Message: fmt.Sprintf("saved package %q (background sync started for %d users)", req.Package, pkgCount)}
+			}
+			synced, err := e.ApplyPackage(ctx, req.Package)
 			if err != nil {
 				return ipc.Response{OK: false, Error: err.Error()}
 			}
+			return ipc.Response{OK: true, Message: fmt.Sprintf("saved package %q (synced %d users)", req.Package, synced)}
 		}
-		return ipc.Response{OK: true, Message: fmt.Sprintf("saved package %q (synced %d users)", req.Package, synced)}
+		return ipc.Response{OK: true, Message: fmt.Sprintf("saved package %q", req.Package)}
 
 	case ipc.ActionSaveUserLimits:
 		if req.Limits == nil {
@@ -439,6 +604,15 @@ func (e *Engine) HandleAdminRequest(ctx context.Context, peerUID uint32, req ipc
 		return ipc.Response{OK: true, Message: fmt.Sprintf("applied limits for %q", req.Username)}
 
 	case ipc.ActionApplyPackageLimits:
+		pkgCount := e.countPackageUsers(req.Package)
+		if e.AsyncSyncThreshold > 0 && pkgCount > e.AsyncSyncThreshold {
+			pkg := req.Package
+			e.runBackgroundSync("package:"+pkg, func(bgCtx context.Context) error {
+				_, err := e.ApplyPackage(bgCtx, pkg)
+				return err
+			})
+			return ipc.Response{OK: true, Message: fmt.Sprintf("background sync started for %d users in package %q", pkgCount, req.Package)}
+		}
 		synced, err := e.ApplyPackage(ctx, req.Package)
 		if err != nil {
 			return ipc.Response{OK: false, Error: err.Error()}
@@ -479,9 +653,6 @@ func (e *Engine) HandleAdminRequest(ctx context.Context, peerUID uint32, req ipc
 	case ipc.ActionGetUpdaterStatus:
 		return e.handleGetUpdaterStatus(ctx)
 
-	case ipc.ActionSaveUpdaterConfig:
-		return e.handleSaveUpdaterConfig(req)
-
 	case ipc.ActionCheckUpdate:
 		if e.Updater == nil {
 			return ipc.Response{OK: false, Error: "GitHub Updater service is not initialized"}
@@ -492,7 +663,22 @@ func (e *Engine) HandleAdminRequest(ctx context.Context, peerUID uint32, req ipc
 		}
 		return ipc.Response{OK: true, Data: st}
 
+	case ipc.ActionSaveUpdaterConfig:
+		if !e.IsRootOrDiradminUID(peerUID) {
+			return ipc.Response{
+				OK:    false,
+				Error: "permission denied: updater configuration is restricted to root/diradmin (use root CLI `da-resourced config-updater`)",
+			}
+		}
+		return e.handleSaveUpdaterConfig(req)
+
 	case ipc.ActionTriggerUpdate:
+		if !e.IsRootOrDiradminUID(peerUID) {
+			return ipc.Response{
+				OK:    false,
+				Error: "permission denied: self-update execution is restricted to root/diradmin (run `da-resourced update` as root via SSH)",
+			}
+		}
 		if e.Updater == nil {
 			return ipc.Response{OK: false, Error: "GitHub Updater service is not initialized"}
 		}
@@ -503,6 +689,12 @@ func (e *Engine) HandleAdminRequest(ctx context.Context, peerUID uint32, req ipc
 		return ipc.Response{OK: true, Message: msg}
 
 	case ipc.ActionRollbackUpdate:
+		if !e.IsRootOrDiradminUID(peerUID) {
+			return ipc.Response{
+				OK:    false,
+				Error: "permission denied: snapshot rollback is restricted to root/diradmin (run `da-resourced rollback` as root via SSH)",
+			}
+		}
 		if e.Updater == nil {
 			return ipc.Response{OK: false, Error: "GitHub Updater service is not initialized"}
 		}
@@ -710,12 +902,15 @@ func (e *Engine) handleGetUpdaterStatus(ctx context.Context) ipc.Response {
 	return ipc.Response{
 		OK: true,
 		Data: ipc.UpdaterStatusData{
-			CurrentVersion:  version.Version,
-			GitHubRepo:      cfg.GitHubRepo,
-			HasToken:        cfg.GitHubToken != "",
-			MaskedToken:     cfg.MaskedToken(),
-			UpdateChannel:   cfg.UpdateChannel,
-			BackupRetention: cfg.BackupRetention,
+			CurrentVersion:    version.Version,
+			GitHubRepo:        cfg.GitHubRepo,
+			RepoPinned:        !cfg.AllowCustomRepo,
+			SignatureRequired: version.DefaultReleasePublicKeyHex != "",
+			RootOnlyActions:   true,
+			HasToken:          cfg.GitHubToken != "",
+			MaskedToken:       cfg.MaskedToken(),
+			UpdateChannel:     cfg.UpdateChannel,
+			BackupRetention:   cfg.BackupRetention,
 		},
 	}
 }
@@ -725,8 +920,12 @@ func (e *Engine) handleSaveUpdaterConfig(req ipc.Request) ipc.Response {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return ipc.Response{OK: false, Error: err.Error()}
 	}
-	if req.GitHubRepo != "" {
-		existing.GitHubRepo = req.GitHubRepo
+	// Repository is pinned over IPC to block privilege escalation via untrusted repositories (S1).
+	if trimmedRepo := strings.TrimSpace(req.GitHubRepo); trimmedRepo != "" && trimmedRepo != existing.GitHubRepo {
+		return ipc.Response{
+			OK:    false,
+			Error: fmt.Sprintf("changing github_repo over IPC is disabled (pinned to %q)", existing.GitHubRepo),
+		}
 	}
 	if !req.KeepStoredToken {
 		existing.GitHubToken = req.GitHubToken

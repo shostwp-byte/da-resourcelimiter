@@ -25,12 +25,11 @@ func (f *fakeRunner) Run(_ context.Context, name string, args ...string) error {
 	return nil
 }
 
-func TestApplyUserSliceAndStats(t *testing.T) {
+func TestApplyUserSliceStatsAndOrphanPrune(t *testing.T) {
 	tmp := t.TempDir()
 	systemdDir := filepath.Join(tmp, "systemd")
 	cgRoot := filepath.Join(tmp, "cgroup")
 
-	// Simulate Cgroups v2 unified root
 	if err := os.MkdirAll(cgRoot, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -41,9 +40,8 @@ func TestApplyUserSliceAndStats(t *testing.T) {
 	uid := uint32(1005)
 	runner := &fakeRunner{
 		onRun: func(name string, args ...string) error {
-			// Simulate systemd creating user-1005.slice directory upon `systemctl start user-1005.slice`
-			if name == "systemctl" && len(args) == 2 && args[0] == "start" && args[1] == "user-1005.slice" {
-				return os.MkdirAll(filepath.Join(cgRoot, "user.slice", "user-1005.slice"), 0o755)
+			if name == "systemctl" && len(args) == 2 && args[0] == "start" && strings.HasPrefix(args[1], "user-") {
+				return os.MkdirAll(filepath.Join(cgRoot, "user.slice", args[1]), 0o755)
 			}
 			return nil
 		},
@@ -60,34 +58,50 @@ func TestApplyUserSliceAndStats(t *testing.T) {
 	limits.MemMaxMB = 2048
 	limits.TasksMax = 100
 
-	if err := mgr.ApplyUserSlice(context.Background(), uid, limits); err != nil {
-		t.Fatalf("ApplyUserSlice: %v", err)
+	if err := mgr.ApplyUserSliceForAccount(context.Background(), "vinahost", uid, limits); err != nil {
+		t.Fatalf("ApplyUserSliceForAccount: %v", err)
 	}
 
-	// Verify drop-in file contents
 	raw, err := os.ReadFile(mgr.SliceDropInPath(uid))
 	if err != nil {
 		t.Fatalf("read drop-in: %v", err)
 	}
 	content := string(raw)
-	for _, expected := range []string{"CPUQuota=150%", "MemoryHigh=1536M", "MemoryMax=2048M", "MemorySwapMax=0M", "TasksMax=100"} {
+	for _, expected := range []string{"# DA-User=vinahost", "CPUQuota=150%", "MemoryHigh=1536M", "MemoryMax=2048M", "MemorySwapMax=0M", "TasksMax=100"} {
 		if !strings.Contains(content, expected) {
 			t.Errorf("drop-in missing %q:\n%s", expected, content)
 		}
 	}
 
-	// Verify da-php.scope was created under user-1005.slice
 	if st, err := os.Stat(mgr.PHPScopeDir(uid)); err != nil || !st.IsDir() {
 		t.Fatalf("expected da-php.scope directory to exist, err=%v", err)
 	}
 
 	// Re-applying identical limits must NOT invoke daemon-reload again
 	prevCalls := len(runner.calls)
-	if err := mgr.ApplyUserSlice(context.Background(), uid, limits); err != nil {
-		t.Fatalf("idempotent ApplyUserSlice: %v", err)
+	if err := mgr.ApplyUserSliceForAccount(context.Background(), "vinahost", uid, limits); err != nil {
+		t.Fatalf("idempotent ApplyUserSliceForAccount: %v", err)
 	}
 	if len(runner.calls) != prevCalls {
 		t.Fatalf("expected 0 extra systemctl calls on unchanged slice, got %v", runner.calls[prevCalls:])
+	}
+
+	// Stage a second user (uid 1009, "deleteduser"), then prune orphans with only uid 1005 active (R5)
+	if _, err := mgr.StageUserSliceForAccount("deleteduser", 1009, limits); err != nil {
+		t.Fatalf("StageUserSliceForAccount 1009: %v", err)
+	}
+	pruned, err := mgr.PruneOrphanSlices(context.Background(), map[uint32]struct{}{1005: {}}, "deleteduser")
+	if err != nil {
+		t.Fatalf("PruneOrphanSlices: %v", err)
+	}
+	if pruned != 1 {
+		t.Fatalf("expected 1 orphaned slice pruned, got %d", pruned)
+	}
+	if _, err := os.Stat(mgr.SliceDropInPath(1009)); !os.IsNotExist(err) {
+		t.Fatalf("expected orphaned user-1009 drop-in to be removed, err=%v", err)
+	}
+	if _, err := os.Stat(mgr.SliceDropInPath(1005)); err != nil {
+		t.Fatalf("active user-1005 drop-in must remain intact: %v", err)
 	}
 
 	// Simulate kernel cgroup v2 stat files and read telemetry

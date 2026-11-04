@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	DropInFileName = "50-da-limits.conf"
-	PHPScopeName   = "da-php.scope"
+	DropInFileName      = "50-da-limits.conf"
+	PHPScopeName        = "da-php.scope"
+	managedHeaderPrefix = "# Managed by DA-ResourceLimiter"
 )
 
 // CommandRunner abstracts systemd CLI execution so slice operations are deterministic in tests.
@@ -111,8 +112,17 @@ func (m *Manager) PHPScopeDir(uid uint32) string {
 
 // RenderDropIn builds the systemd slice configuration matching Section 4.1.2 of the specification.
 func RenderDropIn(limits config.ResourceLimits) string {
+	return RenderDropInForAccount("", limits)
+}
+
+// RenderDropInForAccount builds the systemd slice configuration and records the owning username
+// in a comment so orphan cleanup can still identify destroyed DirectAdmin users after /etc/passwd removal (R5).
+func RenderDropInForAccount(username string, limits config.ResourceLimits) string {
 	var b strings.Builder
-	b.WriteString("# Managed by DA-ResourceLimiter (do not edit manually)\n")
+	b.WriteString(managedHeaderPrefix + " (do not edit manually)\n")
+	if username != "" {
+		fmt.Fprintf(&b, "# DA-User=%s\n", username)
+	}
 	b.WriteString("[Slice]\n")
 	b.WriteString("CPUAccounting=yes\n")
 	fmt.Fprintf(&b, "CPUWeight=%d\n", limits.CPUWeight)
@@ -130,6 +140,12 @@ func RenderDropIn(limits config.ResourceLimits) string {
 
 // StageUserSlice writes or removes 50-da-limits.conf without calling daemon-reload yet (useful for batch apply).
 func (m *Manager) StageUserSlice(uid uint32, limits config.ResourceLimits) (changed bool, err error) {
+	return m.StageUserSliceForAccount("", uid, limits)
+}
+
+// StageUserSliceForAccount writes or removes 50-da-limits.conf using a unique temporary file (R7)
+// and embeds optional username metadata for post-deletion orphan cleanup (R5).
+func (m *Manager) StageUserSliceForAccount(username string, uid uint32, limits config.ResourceLimits) (changed bool, err error) {
 	if !limits.Enabled {
 		return m.removeDropInFile(uid)
 	}
@@ -137,24 +153,49 @@ func (m *Manager) StageUserSlice(uid uint32, limits config.ResourceLimits) (chan
 		return false, err
 	}
 
-	desired := []byte(RenderDropIn(limits))
+	desired := []byte(RenderDropInForAccount(username, limits))
+	dropInDir := m.SliceDropInDir(uid)
 	dropInPath := m.SliceDropInPath(uid)
 
 	if existing, err := os.ReadFile(dropInPath); err == nil && bytes.Equal(existing, desired) {
 		return false, nil
 	}
 
-	if err := os.MkdirAll(m.SliceDropInDir(uid), 0o755); err != nil {
-		return false, fmt.Errorf("mkdir %s: %w", m.SliceDropInDir(uid), err)
+	if err := os.MkdirAll(dropInDir, 0o755); err != nil {
+		return false, fmt.Errorf("mkdir %s: %w", dropInDir, err)
 	}
-	tmpPath := dropInPath + ".tmp"
-	if err := os.WriteFile(tmpPath, desired, 0o644); err != nil {
+
+	tmp, err := os.CreateTemp(dropInDir, ".50-da-limits-*.tmp")
+	if err != nil {
+		return false, fmt.Errorf("create temp in %s: %w", dropInDir, err)
+	}
+	tmpPath := tmp.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmp.Write(desired); err != nil {
+		_ = tmp.Close()
 		return false, fmt.Errorf("write %s: %w", tmpPath, err)
 	}
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return false, fmt.Errorf("chmod %s: %w", tmpPath, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return false, fmt.Errorf("sync %s: %w", tmpPath, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return false, fmt.Errorf("close %s: %w", tmpPath, err)
+	}
 	if err := os.Rename(tmpPath, dropInPath); err != nil {
-		_ = os.Remove(tmpPath)
 		return false, fmt.Errorf("rename %s: %w", dropInPath, err)
 	}
+	cleanupTmp = false
 	return true, nil
 }
 
@@ -183,7 +224,12 @@ func (m *Manager) EnsureSliceAndPHPScope(ctx context.Context, uid uint32) error 
 
 // ApplyUserSlice writes 50-da-limits.conf, reloads systemd if needed, starts the slice, and ensures da-php.scope.
 func (m *Manager) ApplyUserSlice(ctx context.Context, uid uint32, limits config.ResourceLimits) error {
-	changed, err := m.StageUserSlice(uid, limits)
+	return m.ApplyUserSliceForAccount(ctx, "", uid, limits)
+}
+
+// ApplyUserSliceForAccount writes 50-da-limits.conf with owner metadata, reloads systemd if needed, and ensures da-php.scope.
+func (m *Manager) ApplyUserSliceForAccount(ctx context.Context, username string, uid uint32, limits config.ResourceLimits) error {
+	changed, err := m.StageUserSliceForAccount(username, uid, limits)
 	if err != nil {
 		return err
 	}
@@ -211,6 +257,66 @@ func (m *Manager) RemoveUserSlice(ctx context.Context, uid uint32) error {
 		return m.ReloadSystemd(ctx)
 	}
 	return nil
+}
+
+// PruneOrphanSlices scans SystemdSystemDir for managed user-<UID>.slice.d/50-da-limits.conf files
+// whose UID is no longer present in validUIDs (or whose embedded DA-User matches destroyedUser),
+// removes them, and triggers a single systemctl daemon-reload if any drop-in was deleted (R5).
+func (m *Manager) PruneOrphanSlices(ctx context.Context, validUIDs map[uint32]struct{}, destroyedUser string) (int, error) {
+	entries, err := os.ReadDir(m.SystemdSystemDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
+
+	removed := 0
+	for _, ent := range entries {
+		if !ent.IsDir() {
+			continue
+		}
+		name := ent.Name()
+		if !strings.HasPrefix(name, "user-") || !strings.HasSuffix(name, ".slice.d") {
+			continue
+		}
+		uidStr := strings.TrimSuffix(strings.TrimPrefix(name, "user-"), ".slice.d")
+		uid64, parseErr := strconv.ParseUint(uidStr, 10, 32)
+		if parseErr != nil {
+			continue
+		}
+		uid := uint32(uid64)
+
+		dropInPath := m.SliceDropInPath(uid)
+		raw, readErr := os.ReadFile(dropInPath)
+		if readErr != nil {
+			continue
+		}
+		text := string(raw)
+		if !strings.HasPrefix(text, managedHeaderPrefix) {
+			continue
+		}
+
+		_, stillActive := validUIDs[uid]
+		matchesDestroyed := destroyedUser != "" && strings.Contains(text, "# DA-User="+destroyedUser+"\n")
+		if stillActive && !matchesDestroyed {
+			continue
+		}
+
+		if changed, _ := m.removeDropInFile(uid); changed {
+			m.mu.Lock()
+			delete(m.cpuSamples, uid)
+			m.mu.Unlock()
+			removed++
+		}
+	}
+
+	if removed > 0 {
+		if err := m.ReloadSystemd(ctx); err != nil {
+			return removed, err
+		}
+	}
+	return removed, nil
 }
 
 func (m *Manager) removeDropInFile(uid uint32) (bool, error) {

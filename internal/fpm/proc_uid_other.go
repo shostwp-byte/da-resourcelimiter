@@ -17,3 +17,7 @@ func statOwnerAndMode(path string) (uid int, gid int, mode os.FileMode, ok bool)
 	}
 	return -1, -1, 0o600, false
 }
+
+func acquireFileLock(_ string) (func(), error) {
+	return func() {}, nil
+}

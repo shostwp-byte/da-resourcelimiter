@@ -3,6 +3,7 @@ package logger
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -56,5 +57,38 @@ func TestViolationLoggerRotationAndQuery(t *testing.T) {
 	_, sqlKills, _ := vlog.CountSince("vinahost", baseTS)
 	if sqlKills == 0 {
 		t.Fatal("expected positive sqlKills count in CountSince")
+	}
+}
+
+func TestMultiChunkReverseTailReadAndTimestampCutoff(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "large.jsonl")
+	vlog := NewViolationLogger(logPath, 5*1024*1024, 1)
+
+	padding := strings.Repeat("X", 400)
+	baseTS := int64(1700000000)
+	// Write ~120 KB (> 3 x 32 KB reverse chunks)
+	for i := 1; i <= 240; i++ {
+		if err := vlog.Log(ipc.ViolationEntry{
+			TimestampUnix: baseTS + int64(i),
+			Username:      "alice",
+			Type:          TypeCgroupOOMKill,
+			Detail:        fmt.Sprintf("entry-%d-%s", i, padding),
+		}); err != nil {
+			t.Fatalf("Log #%d: %v", i, err)
+		}
+	}
+
+	top5, err := vlog.Query("alice", "", 5)
+	if err != nil {
+		t.Fatalf("Query top5: %v", err)
+	}
+	if len(top5) != 5 || top5[0].TimestampUnix != baseTS+240 || top5[4].TimestampUnix != baseTS+236 {
+		t.Fatalf("unexpected reverse chunked top5: first=%+v last=%+v", top5[0], top5[len(top5)-1])
+	}
+
+	oomCount, _, _ := vlog.CountSince("alice", baseTS+201)
+	if oomCount != 40 {
+		t.Fatalf("expected 40 entries with ts >= baseTS+201, got %d", oomCount)
 	}
 }

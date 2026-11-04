@@ -560,7 +560,10 @@ cat <<'DARL_ADMIN_HTML'
     </div>
 
     <div class="darl-card">
-      <h3 style="margin:0 0 12px 0;font-size:15.5px;">Kiểm tra &amp; Cập nhật Một chạm từ GitHub Releases</h3>
+      <h3 style="margin:0 0 10px 0;font-size:15.5px;">Kiểm tra &amp; Cập nhật từ GitHub Releases (Ed25519 + SHA-256 Verified)</h3>
+      <div style="font-size:12.5px;color:var(--text-soft);background:#f8fafc;border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:12px;line-height:1.5;">
+        <strong>Chính sách Bảo mật Root:</strong> Nguồn cập nhật được ghim cứng vào repository chính thức và bắt buộc xác thực chữ ký số <strong>Ed25519</strong> trước khi thực thi. Các thao tác cập nhật/khôi phục cấp hệ thống chỉ cho phép tiến trình <code class="darl-mono">root</code> / <code class="darl-mono">diradmin</code> (hoặc chạy trực tiếp qua SSH root: <code class="darl-mono">da-resourced update</code> / <code class="darl-mono">da-resourced rollback</code>).
+      </div>
       <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:12px;">
         <button type="button" class="darl-btn darl-btn-outline" id="btn-upd-check">Check for Updates</button>
         <button type="button" class="darl-btn darl-btn-primary" id="btn-upd-trigger">One-Click Update Now</button>
@@ -573,11 +576,11 @@ cat <<'DARL_ADMIN_HTML'
     </div>
 
     <div class="darl-card">
-      <h3 style="margin:0 0 14px 0;font-size:15.5px;">Cấu hình GitHub Repository (Hỗ trợ cả Public &amp; Private Repo)</h3>
+      <h3 style="margin:0 0 14px 0;font-size:15.5px;">Cấu hình GitHub Updater (Hỗ trợ cả Public &amp; Private Repo)</h3>
       <div class="darl-grid-form">
         <div class="darl-field">
-          <label>GitHub Repository (owner/repo)</label>
-          <input type="text" id="upd-repo" class="darl-input" placeholder="shostwp-byte/da-resourcelimiter" />
+          <label>GitHub Repository (Đã ghim cố định)</label>
+          <input type="text" id="upd-repo" class="darl-input" readonly style="background:#f1f5f9;color:var(--muted);cursor:not-allowed;" placeholder="shostwp-byte/da-resourcelimiter" />
         </div>
         <div class="darl-field">
           <label>GitHub Personal Access Token (Tuỳ chọn cho Private Repo)</label>
@@ -611,6 +614,7 @@ cat <<'DARL_ADMIN_HTML'
     (function () {
       const ROOT_ID = 'darl-root';
       const API_URL = '/CMD_PLUGINS_ADMIN/da_resource_limiter/api.raw';
+      let csrfToken = '';
       let cachedUsers = [];
       let cachedPackages = null;
       let selectedUsername = '';
@@ -762,13 +766,30 @@ cat <<'DARL_ADMIN_HTML'
         return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
       }
 
+      async function ensureCsrfToken() {
+        if (csrfToken) return csrfToken;
+        try {
+          const pre = await fetch(API_URL + '?action=ping', { credentials: 'same-origin' });
+          const pj = await pre.json();
+          if (pj && typeof pj.csrf_token === 'string' && pj.csrf_token) {
+            csrfToken = pj.csrf_token;
+          }
+        } catch (_) {}
+        return csrfToken;
+      }
+
       async function callAPI(payload, usePost) {
         const opts = { credentials: 'same-origin' };
         let url = API_URL;
         if (usePost) {
+          await ensureCsrfToken();
           opts.method = 'POST';
-          opts.headers = { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' };
-          opts.body = 'payload_b64=' + encodeUTF8Base64Url(JSON.stringify(payload));
+          opts.headers = {
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'X-Requested-With': 'XMLHttpRequest'
+          };
+          opts.body = 'csrf_token=' + encodeURIComponent(csrfToken) +
+            '&payload_b64=' + encodeUTF8Base64Url(JSON.stringify(payload));
         } else {
           const qs = Object.keys(payload).map(function (k) {
             return encodeURIComponent(k) + '=' + encodeURIComponent(payload[k]);
@@ -776,7 +797,11 @@ cat <<'DARL_ADMIN_HTML'
           url += '?' + qs;
         }
         const res = await fetch(url, opts);
-        return await res.json();
+        const data = await res.json();
+        if (data && typeof data.csrf_token === 'string' && data.csrf_token) {
+          csrfToken = data.csrf_token;
+        }
+        return data;
       }
 
       function buildFieldsGrid(containerId, prefix) {
@@ -1169,7 +1194,6 @@ cat <<'DARL_ADMIN_HTML'
       document.getElementById('btn-upd-save').addEventListener('click', async function () {
         const r = await callAPI({
           action: 'save_updater_config',
-          github_repo: document.getElementById('upd-repo').value.trim(),
           github_token: document.getElementById('upd-token').value.trim(),
           keep_stored_token: document.getElementById('upd-keep-token').checked,
           update_channel: document.getElementById('upd-channel').value,

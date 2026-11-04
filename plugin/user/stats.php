@@ -19,6 +19,9 @@ function emit_user_json(array $body): void
 
 $daUsername = trim((string) (getenv('USERNAME') ?: ''));
 $qs = (string) (getenv('QUERY_STRING') ?: '');
+if (strpos($qs, '&amp;') !== false && preg_match('/&(?!amp;)/', $qs) === 0) {
+    $qs = str_replace('&amp;', '&', $qs);
+}
 parse_str($qs, $query);
 
 $action = isset($query['action']) && $query['action'] === 'get_logs' ? 'get_logs' : 'get_user_stats';

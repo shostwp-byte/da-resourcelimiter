@@ -178,16 +178,19 @@ type ViolationEntry struct {
 
 // UpdaterStatusData exposes safe GitHub Updater settings & latest release info to Admin UI Tab 5.
 type UpdaterStatusData struct {
-	CurrentVersion  string `json:"current_version"`
-	GitHubRepo      string `json:"github_repo"`
-	HasToken        bool   `json:"has_token"`
-	MaskedToken     string `json:"masked_token"`
-	UpdateChannel   string `json:"update_channel"`
-	BackupRetention int    `json:"backup_retention"`
-	LatestVersion   string `json:"latest_version,omitempty"`
-	UpdateAvailable bool   `json:"update_available"`
-	ReleaseNotes    string `json:"release_notes,omitempty"`
-	PublishedAt     string `json:"published_at,omitempty"`
-	LastJobState    string `json:"last_job_state,omitempty"`
-	LastJobMessage  string `json:"last_job_message,omitempty"`
+	CurrentVersion    string `json:"current_version"`
+	GitHubRepo        string `json:"github_repo"`
+	RepoPinned        bool   `json:"repo_pinned"`
+	SignatureRequired bool   `json:"signature_required"`
+	RootOnlyActions   bool   `json:"root_only_actions"`
+	HasToken          bool   `json:"has_token"`
+	MaskedToken       string `json:"masked_token"`
+	UpdateChannel     string `json:"update_channel"`
+	BackupRetention   int    `json:"backup_retention"`
+	LatestVersion     string `json:"latest_version,omitempty"`
+	UpdateAvailable   bool   `json:"update_available"`
+	ReleaseNotes      string `json:"release_notes,omitempty"`
+	PublishedAt       string `json:"published_at,omitempty"`
+	LastJobState      string `json:"last_job_state,omitempty"`
+	LastJobMessage    string `json:"last_job_message,omitempty"`
 }

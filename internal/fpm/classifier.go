@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/shostwp-byte/da-resourcelimiter/internal/cgroup"
 	"github.com/shostwp-byte/da-resourcelimiter/internal/config"
@@ -21,16 +22,25 @@ type UIDFunc func(procPIDPath string) (uint32, error)
 // EnabledCheckFunc reports whether Cgroup enforcement is active for the given DirectAdmin account.
 type EnabledCheckFunc func(acct dausers.Account) bool
 
+type classifiedPID struct {
+	uid       uint32
+	startTime string
+}
+
 // Classifier scans /proc for PHP-FPM and OpenLiteSpeed lsphp workers owned by DirectAdmin users
 // and migrates them from system.slice into user-<UID>.slice/da-php.scope.
 type Classifier struct {
-	ProcRoot     string
-	Registry     *dausers.Registry
-	CgroupMgr    *cgroup.Manager
-	ReadUID      UIDFunc
-	IsEnabled    EnabledCheckFunc
-	classifiedOK map[string]uint32 // pid -> uid cache to avoid redundant file writes on steady workers
+	ProcRoot  string
+	Registry  *dausers.Registry
+	CgroupMgr *cgroup.Manager
+	ReadUID   UIDFunc
+	IsEnabled EnabledCheckFunc
+
+	mu           sync.Mutex
+	classifiedOK map[string]classifiedPID // pid -> (uid, startTime) cache guarded by mu
 }
+
+var userConfSyncMu sync.Mutex
 
 func NewClassifier(procRoot string, reg *dausers.Registry, cgMgr *cgroup.Manager, isEnabled EnabledCheckFunc) *Classifier {
 	if procRoot == "" {
@@ -42,13 +52,16 @@ func NewClassifier(procRoot string, reg *dausers.Registry, cgMgr *cgroup.Manager
 		CgroupMgr:    cgMgr,
 		ReadUID:      statUID,
 		IsEnabled:    isEnabled,
-		classifiedOK: make(map[string]uint32, 256),
+		classifiedOK: make(map[string]classifiedPID, 256),
 	}
 }
 
 // ScanOnce inspects /proc once and moves any unclassified customer PHP workers into their user slice.
-// Returns the count of newly migrated PIDs.
+// Serialized via c.mu so concurrent periodic scans and IPC/hook ApplyUser calls are completely race-free.
 func (c *Classifier) ScanOnce(ctx context.Context, filterUID uint32) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	entries, err := os.ReadDir(c.ProcRoot)
 	if err != nil {
 		return 0, fmt.Errorf("read %s: %w", c.ProcRoot, err)
@@ -67,14 +80,16 @@ func (c *Classifier) ScanOnce(ctx context.Context, filterUID uint32) (int, error
 		}
 		alivePIDs[pid] = struct{}{}
 
-		// Fast skip if this exact PID was already verified inside da-php.scope
-		if cachedUID, ok := c.classifiedOK[pid]; ok {
-			if filterUID == 0 || cachedUID == filterUID {
+		procPath := filepath.Join(c.ProcRoot, pid)
+		curStart := readProcStartTime(procPath)
+
+		// Fast skip only if this exact (PID, startTime) instance was already verified inside da-php.scope
+		if cached, ok := c.classifiedOK[pid]; ok && cached.startTime == curStart {
+			if filterUID == 0 || cached.uid == filterUID {
 				continue
 			}
 		}
 
-		procPath := filepath.Join(c.ProcRoot, pid)
 		commRaw, err := os.ReadFile(filepath.Join(procPath, "comm"))
 		if err != nil {
 			continue // Process exited mid-scan
@@ -88,7 +103,11 @@ func (c *Classifier) ScanOnce(ctx context.Context, filterUID uint32) (int, error
 		if err != nil {
 			continue
 		}
-		if uid < dausers.MinValidUID || uid > dausers.MaxValidUID {
+		if c.Registry != nil {
+			if !c.Registry.ValidUID(uid) {
+				continue
+			}
+		} else if uid < dausers.MinValidUID || uid > dausers.MaxValidUID {
 			continue
 		}
 		if filterUID != 0 && uid != filterUID {
@@ -109,11 +128,23 @@ func (c *Classifier) ScanOnce(ctx context.Context, filterUID uint32) (int, error
 		}
 		targetRel := fmt.Sprintf("user-%d.slice/%s", uid, cgroup.PHPScopeName)
 		if strings.Contains(string(cgBytes), targetRel) {
-			c.classifiedOK[pid] = uid
+			c.classifiedOK[pid] = classifiedPID{uid: uid, startTime: curStart}
 			continue
 		}
 
 		if err := c.CgroupMgr.EnsureSliceAndPHPScope(ctx, uid); err != nil {
+			continue
+		}
+
+		// Re-verify process identity right before writing cgroup.procs to guard against PID reuse (R10)
+		recheckComm, err := os.ReadFile(filepath.Join(procPath, "comm"))
+		if err != nil || !isPHPWorkerComm(strings.TrimSpace(string(recheckComm))) {
+			continue
+		}
+		if recheckUID, err := c.ReadUID(procPath); err != nil || recheckUID != uid {
+			continue
+		}
+		if recheckStart := readProcStartTime(procPath); recheckStart != curStart {
 			continue
 		}
 
@@ -122,7 +153,7 @@ func (c *Classifier) ScanOnce(ctx context.Context, filterUID uint32) (int, error
 			continue
 		}
 
-		c.classifiedOK[pid] = uid
+		c.classifiedOK[pid] = classifiedPID{uid: uid, startTime: curStart}
 		migrated++
 	}
 
@@ -134,6 +165,26 @@ func (c *Classifier) ScanOnce(ctx context.Context, filterUID uint32) (int, error
 	}
 
 	return migrated, nil
+}
+
+// readProcStartTime extracts field 22 (starttime in clock ticks since boot) from /proc/<pid>/stat
+// when present, preventing recycled PIDs from hitting stale cache entries.
+func readProcStartTime(procPIDPath string) string {
+	raw, err := os.ReadFile(filepath.Join(procPIDPath, "stat"))
+	if err != nil {
+		return ""
+	}
+	s := string(raw)
+	closeParen := strings.LastIndexByte(s, ')')
+	if closeParen < 0 || closeParen+2 >= len(s) {
+		return ""
+	}
+	fields := strings.Fields(s[closeParen+2:])
+	// Field 3 is fields[0], so field 22 (starttime) is fields[19]
+	if len(fields) > 19 {
+		return fields[19]
+	}
+	return ""
 }
 
 func isPHPWorkerComm(comm string) bool {
@@ -168,7 +219,7 @@ func writePIDToCgroupProcs(procsPath, pid string) error {
 
 // SyncDAUserPHPConf updates DA_PHP_MAX_CHILDREN and DA_PHP_MEM_LIMIT tokens inside
 // /usr/local/directadmin/data/users/<username>/user.conf while strictly preserving
-// DirectAdmin's required diradmin:diradmin (0600) ownership and all other fields.
+// DirectAdmin's required diradmin:diradmin (0600) ownership and serializing concurrent writes.
 func SyncDAUserPHPConf(daUsersDir, username string, limits config.ResourceLimits) error {
 	if err := config.ValidateIdentifier(username); err != nil {
 		return err
@@ -178,6 +229,24 @@ func SyncDAUserPHPConf(daUsersDir, username string, limits config.ResourceLimits
 	}
 	userDir := filepath.Join(daUsersDir, username)
 	userConf := filepath.Join(userDir, "user.conf")
+
+	userConfSyncMu.Lock()
+	defer userConfSyncMu.Unlock()
+
+	if st, err := os.Stat(userDir); err != nil || !st.IsDir() {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
+	unlock, lockErr := acquireFileLock(filepath.Join(userDir, ".user.conf.da-limiter.lock"))
+	if lockErr == nil && unlock != nil {
+		defer unlock()
+	}
 
 	rawBytes, err := os.ReadFile(userConf)
 	if err != nil {
@@ -238,20 +307,49 @@ func SyncDAUserPHPConf(daUsersDir, username string, limits config.ResourceLimits
 		return nil
 	}
 
-	tmp := userConf + ".da-limiter.tmp"
-	if err := os.WriteFile(tmp, []byte(out), curMode); err != nil {
+	tmpFile, err := os.CreateTemp(userDir, ".user.conf.da-limiter-*")
+	if err != nil {
 		return err
 	}
+	tmpName := tmpFile.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if _, err := tmpFile.WriteString(out); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Chmod(curMode); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+
 	if targetUID >= 0 && targetGID >= 0 {
-		if err := os.Chown(tmp, targetUID, targetGID); err != nil {
-			_ = os.Remove(tmp)
-			return fmt.Errorf("chown %s to diradmin (%d:%d): %w", tmp, targetUID, targetGID, err)
+		if err := os.Chown(tmpName, targetUID, targetGID); err != nil {
+			return fmt.Errorf("chown %s to diradmin (%d:%d): %w", tmpName, targetUID, targetGID, err)
 		}
 	}
-	if err := os.Rename(tmp, userConf); err != nil {
-		_ = os.Remove(tmp)
+
+	// Re-check user.conf hasn't changed while staging temp file to avoid clobbering concurrent DA edits (R6)
+	if latestRaw, rErr := os.ReadFile(userConf); rErr == nil && string(latestRaw) != string(rawBytes) {
+		return fmt.Errorf("concurrent modification detected on %s; skipping to preserve DirectAdmin state", userConf)
+	}
+
+	if err := os.Rename(tmpName, userConf); err != nil {
 		return err
 	}
+	cleanupTmp = false
 	return nil
 }
 

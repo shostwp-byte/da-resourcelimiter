@@ -58,6 +58,37 @@ func TestResolveUserLimitsHierarchy(t *testing.T) {
 	}
 }
 
+func TestPenaltyValidationAndFileLoadGuard(t *testing.T) {
+	lim := DefaultLimits()
+	lim.MySQLPenaltyConn = 0
+	if err := lim.Validate(); err == nil {
+		t.Fatal("expected Validate() to reject MYSQL_PENALTY_CONN=0 (which would mean unlimited in MariaDB)")
+	}
+
+	lim = DefaultLimits()
+	lim.MySQLPenaltyThreshold = 0
+	if err := lim.Validate(); err == nil {
+		t.Fatal("expected Validate() to reject MYSQL_PENALTY_THRESHOLD=0")
+	}
+
+	lim = DefaultLimits()
+	lim.MySQLPenaltyTimeSec = 0
+	if err := lim.Validate(); err == nil {
+		t.Fatal("expected Validate() to reject MYSQL_PENALTY_TIME_SEC=0")
+	}
+
+	// Verify ResolveUserLimits also validates hand-edited files on disk (R2)
+	tmp := t.TempDir()
+	store := NewStore(tmp, "")
+	badConf := "ENABLED=yes\nMYSQL_PENALTY_CONN=0\n"
+	if err := os.WriteFile(store.DefaultConfPath(), []byte(badConf), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ResolveUserLimits("alice", ""); err == nil {
+		t.Fatal("expected ResolveUserLimits to reject MYSQL_PENALTY_CONN=0 from hand-edited default.conf")
+	}
+}
+
 func TestMigrateDefaultKeysPreservesExistingValues(t *testing.T) {
 	tmp := t.TempDir()
 	store := NewStore(tmp, "")
@@ -88,9 +119,10 @@ func TestMigrateDefaultKeysPreservesExistingValues(t *testing.T) {
 	}
 }
 
-func TestUpdaterConfigAndMaskedToken(t *testing.T) {
+func TestUpdaterConfigRepoPinningAndValidation(t *testing.T) {
 	tmp := t.TempDir()
-	store := NewStore(tmp, filepath.Join(tmp, "etc", "updater.conf"))
+	updaterPath := filepath.Join(tmp, "etc", "updater.conf")
+	store := NewStore(tmp, updaterPath)
 
 	cfg, err := store.LoadUpdaterConfig()
 	if err != nil {
@@ -115,6 +147,33 @@ func TestUpdaterConfigAndMaskedToken(t *testing.T) {
 	}
 	if masked := loaded.MaskedToken(); masked != "gith****...cdef" {
 		t.Fatalf("unexpected masked token: %s", masked)
+	}
+
+	// Repo pinning (S1): without ALLOW_CUSTOM_REPO=yes, GITHUB_REPO in file is ignored and pinned to official repo
+	_ = os.WriteFile(updaterPath, []byte("GITHUB_REPO=attacker/evilrepo\nUPDATE_CHANNEL=stable\n"), 0o600)
+	pinnedLoaded, err := store.LoadUpdaterConfig()
+	if err != nil {
+		t.Fatalf("LoadUpdaterConfig pinned: %v", err)
+	}
+	if pinnedLoaded.GitHubRepo != "shostwp-byte/da-resourcelimiter" {
+		t.Fatalf("expected repo to stay pinned to official repo, got %q", pinnedLoaded.GitHubRepo)
+	}
+
+	// ValidateGitHubRepo and ValidateReleaseTag (S6)
+	for _, badRepo := range []string{"", "onlyowner", "a/b/c", "a/b?foo=1", "../evil/repo", "a/%2e%2e"} {
+		if err := ValidateGitHubRepo(badRepo); err == nil {
+			t.Errorf("expected ValidateGitHubRepo(%q) to fail", badRepo)
+		}
+	}
+	for _, goodTag := range []string{"v1.0.0", "v1.0.4.1", "v1.2.0-beta.1", "1.0.4.1"} {
+		if err := ValidateReleaseTag(goodTag); err != nil {
+			t.Errorf("expected ValidateReleaseTag(%q) to pass, got %v", goodTag, err)
+		}
+	}
+	for _, badTag := range []string{"", "..", "v1.0;rm -rf /", "v1.0/../../etc", "v1.0?x=1"} {
+		if err := ValidateReleaseTag(badTag); err == nil {
+			t.Errorf("expected ValidateReleaseTag(%q) to fail", badTag)
+		}
 	}
 }
 

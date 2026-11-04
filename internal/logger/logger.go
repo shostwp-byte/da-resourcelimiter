@@ -1,10 +1,11 @@
 package logger
 
 import (
-	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +27,8 @@ const (
 	DefaultLogPath    = "/var/log/da-resourced/violations.jsonl"
 	DefaultMaxBytes   = 10 * 1024 * 1024 // 10 MB per file
 	DefaultMaxBackups = 3
+	reverseChunkBytes = 32 * 1024 // Read 32 KB blocks from end of file instead of loading full 10 MB into RAM (S5)
+	maxLineSafetyCap  = 1024 * 1024
 )
 
 // ViolationLogger appends structured JSONL violation events with automatic size-based rotation.
@@ -110,6 +113,10 @@ func (l *ViolationLogger) rotateLocked() error {
 
 // Query returns recent violation entries in newest-first order, optionally filtered by username and/or type.
 func (l *ViolationLogger) Query(username, violationType string, limit int) ([]ipc.ViolationEntry, error) {
+	return l.querySince(username, violationType, limit, 0)
+}
+
+func (l *ViolationLogger) querySince(username, violationType string, limit int, minTimestampUnix int64) ([]ipc.ViolationEntry, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -120,7 +127,8 @@ func (l *ViolationLogger) Query(username, violationType string, limit int) ([]ip
 	violationType = strings.TrimSpace(violationType)
 
 	l.mu.Lock()
-	files := []string{l.path}
+	files := make([]string, 0, l.maxBackups+1)
+	files = append(files, l.path)
 	for i := 1; i <= l.maxBackups; i++ {
 		files = append(files, fmt.Sprintf("%s.%d", l.path, i))
 	}
@@ -128,7 +136,7 @@ func (l *ViolationLogger) Query(username, violationType string, limit int) ([]ip
 
 	var collected []ipc.ViolationEntry
 	for _, filePath := range files {
-		entries, err := readMatchingFileReverse(filePath, username, violationType, limit-len(collected))
+		entries, reachedCutoff, err := readMatchingFileReverseChunked(filePath, username, violationType, limit-len(collected), minTimestampUnix)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
@@ -136,7 +144,7 @@ func (l *ViolationLogger) Query(username, violationType string, limit int) ([]ip
 			return collected, err
 		}
 		collected = append(collected, entries...)
-		if len(collected) >= limit {
+		if len(collected) >= limit || reachedCutoff {
 			break
 		}
 	}
@@ -145,7 +153,7 @@ func (l *ViolationLogger) Query(username, violationType string, limit int) ([]ip
 
 // CountSince counts violations for a specific user since unixCutoff (used for 24h User UI summary).
 func (l *ViolationLogger) CountSince(username string, unixCutoff int64) (oomCount int, sqlKillCount int, penaltyCount int) {
-	entries, err := l.Query(username, "", 1000)
+	entries, err := l.querySince(username, "", 1000, unixCutoff)
 	if err != nil {
 		return 0, 0, 0
 	}
@@ -165,47 +173,100 @@ func (l *ViolationLogger) CountSince(username string, unixCutoff int64) (oomCoun
 	return oomCount, sqlKillCount, penaltyCount
 }
 
-func readMatchingFileReverse(path, username, violationType string, needed int) ([]ipc.ViolationEntry, error) {
+// readMatchingFileReverseChunked reads JSONL files backwards from EOF in 32 KB blocks so
+// large 10 MB log files are never buffered wholly in memory (S5).
+func readMatchingFileReverseChunked(path, username, violationType string, needed int, minTimestampUnix int64) ([]ipc.ViolationEntry, bool, error) {
+	if needed <= 0 {
+		return nil, false, nil
+	}
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer f.Close()
 
-	var allLines []string
-	scanner := bufio.NewScanner(f)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line != "" {
-			allLines = append(allLines, line)
-		}
+	st, err := f.Stat()
+	if err != nil {
+		return nil, false, err
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
+	pos := st.Size()
+	if pos == 0 {
+		return nil, false, nil
 	}
 
-	out := make([]ipc.ViolationEntry, 0, minInt(needed, len(allLines)))
-	for i := len(allLines) - 1; i >= 0 && len(out) < needed; i-- {
+	var (
+		out           []ipc.ViolationEntry
+		trailing      []byte
+		reachedCutoff bool
+		buf           = make([]byte, reverseChunkBytes)
+	)
+
+	processLine := func(rawLine []byte) bool {
+		trimmed := bytes.TrimSpace(rawLine)
+		if len(trimmed) == 0 {
+			return false
+		}
+		// Fast substring pre-check before JSON unmarshal when filtering by a specific username
+		if username != "" && !bytes.Contains(trimmed, []byte(username)) {
+			return false
+		}
 		var entry ipc.ViolationEntry
-		if err := json.Unmarshal([]byte(allLines[i]), &entry); err != nil {
-			continue
+		if err := json.Unmarshal(trimmed, &entry); err != nil {
+			return false
+		}
+		if minTimestampUnix > 0 && entry.TimestampUnix > 0 && entry.TimestampUnix < minTimestampUnix {
+			reachedCutoff = true
+			return true
 		}
 		if username != "" && entry.Username != username {
-			continue
+			return false
 		}
 		if violationType != "" && entry.Type != violationType {
-			continue
+			return false
 		}
 		out = append(out, entry)
+		return len(out) >= needed
 	}
-	return out, nil
-}
 
-func minInt(a, b int) int {
-	if a < b {
-		return a
+	for pos > 0 && len(out) < needed && !reachedCutoff {
+		readSize := int64(reverseChunkBytes)
+		if pos < readSize {
+			readSize = pos
+		}
+		pos -= readSize
+
+		n, readErr := f.ReadAt(buf[:readSize], pos)
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return out, reachedCutoff, readErr
+		}
+		chunk := buf[:n]
+
+		combined := make([]byte, len(chunk)+len(trailing))
+		copy(combined, chunk)
+		copy(combined[len(chunk):], trailing)
+
+		for {
+			nl := bytes.LastIndexByte(combined, '\n')
+			if nl < 0 {
+				break
+			}
+			line := combined[nl+1:]
+			combined = combined[:nl]
+			if processLine(line) {
+				return out, reachedCutoff, nil
+			}
+		}
+
+		if len(combined) > maxLineSafetyCap {
+			// Discard corrupted oversized single line without newline
+			trailing = nil
+		} else {
+			trailing = combined
+		}
 	}
-	return b
+
+	if len(trailing) > 0 && len(out) < needed && !reachedCutoff {
+		_ = processLine(trailing)
+	}
+	return out, reachedCutoff, nil
 }

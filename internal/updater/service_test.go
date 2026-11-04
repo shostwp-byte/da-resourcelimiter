@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/shostwp-byte/da-resourcelimiter/internal/config"
@@ -50,28 +51,69 @@ func buildMockReleaseTarGz(t *testing.T) ([]byte, string) {
 	return buf.Bytes(), hex.EncodeToString(sum[:])
 }
 
-func TestSemVerComparison(t *testing.T) {
+func TestSemVerComparisonIncludingFourPartTags(t *testing.T) {
 	if !IsNewerVersion("v0.1.0-dev", "v1.0.0") {
 		t.Fatal("expected v1.0.0 > v0.1.0-dev")
 	}
 	if !IsNewerVersion("v1.2.0", "v1.10.0") {
 		t.Fatal("expected v1.10.0 > v1.2.0")
 	}
+	if !IsNewerVersion("v1.0.4", "v1.0.4.1") {
+		t.Fatal("expected v1.0.4.1 > v1.0.4")
+	}
+	if !IsNewerVersion("v1.0.4.1", "v1.0.5") {
+		t.Fatal("expected v1.0.5 > v1.0.4.1")
+	}
+	if !IsNewerVersion("v1.0.4.2", "v1.0.4.10") {
+		t.Fatal("expected v1.0.4.10 > v1.0.4.2")
+	}
+	if !IsNewerVersion("v1.0.0-beta.2", "v1.0.0-beta.10") {
+		t.Fatal("expected v1.0.0-beta.10 > v1.0.0-beta.2")
+	}
 	if !IsNewerVersion("v1.0.0-beta.1", "v1.0.0") {
 		t.Fatal("expected stable v1.0.0 > pre-release v1.0.0-beta.1")
 	}
-	if IsNewerVersion("v1.2.0", "v1.2.0") {
+	if IsNewerVersion("v1.0.4.1", "v1.0.4.1") {
 		t.Fatal("same version must not be newer")
 	}
 }
 
-func TestPrivateRepoAssetDownloadAndCorruptedSHA256Rejection(t *testing.T) {
-	archiveBytes, validSHA := buildMockReleaseTarGz(t)
-	const secretToken = "github_pat_secret_test_token"
-	corruptChecksumMode := false
+func TestSanitizeTagRejectsDotTraversal(t *testing.T) {
+	for _, bad := range []string{"", ".", "..", "...", "////"} {
+		if got := sanitizeTag(bad); got != "release" {
+			t.Fatalf("sanitizeTag(%q) = %q, want 'release'", bad, got)
+		}
+	}
+}
 
-	// Simulate S3 / objects.githubusercontent.com signed storage server:
-	// Rejects requests if Authorization header is leaked across cross-host 302 redirect!
+func TestPrivateRepoEd25519SignatureSHA256AndConcurrencyGuard(t *testing.T) {
+	archiveBytes, validSHA := buildMockReleaseTarGz(t)
+	pubHex, privHex, err := GenerateKeypairHex()
+	if err != nil {
+		t.Fatalf("GenerateKeypairHex: %v", err)
+	}
+	otherPubHex, otherPrivHex, err := GenerateKeypairHex()
+	if err != nil || otherPubHex == pubHex {
+		t.Fatalf("GenerateKeypairHex #2: %v", err)
+	}
+
+	const secretToken = "github_pat_secret_test_token"
+	var modeMu sync.Mutex
+	corruptChecksumMode := false
+	forgedSigMode := false
+	omitSigAsset := false
+
+	currentChecksumsContent := func() string {
+		modeMu.Lock()
+		corrupt := corruptChecksumMode
+		modeMu.Unlock()
+		shaToServe := validSHA
+		if corrupt {
+			shaToServe = strings.Repeat("0", 64)
+		}
+		return fmt.Sprintf("%s  da-resource-limiter-linux-amd64.tar.gz\n", shaToServe)
+	}
+
 	cdnSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "" {
 			http.Error(w, "S3 error: Authorization header must not be forwarded on redirect", http.StatusBadRequest)
@@ -81,18 +123,28 @@ func TestPrivateRepoAssetDownloadAndCorruptedSHA256Rejection(t *testing.T) {
 		case "/blob/archive":
 			_, _ = w.Write(archiveBytes)
 		case "/blob/checksums":
-			shaToServe := validSHA
-			if corruptChecksumMode {
-				shaToServe = strings.Repeat("0", 64)
+			_, _ = w.Write([]byte(currentChecksumsContent()))
+		case "/blob/checksums.sig":
+			body := []byte(currentChecksumsContent())
+			modeMu.Lock()
+			forged := forgedSigMode
+			modeMu.Unlock()
+			signingKey := privHex
+			if forged {
+				signingKey = otherPrivHex
 			}
-			fmt.Fprintf(w, "%s  da-resource-limiter-linux-amd64.tar.gz\n", shaToServe)
+			sig, signErr := SignDataHex(signingKey, body)
+			if signErr != nil {
+				http.Error(w, signErr.Error(), http.StatusInternalServerError)
+				return
+			}
+			fmt.Fprintf(w, "%s  checksums.txt\n", sig)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer cdnSrv.Close()
 
-	// Simulate Private GitHub REST API Server requiring Bearer token + Accept: application/octet-stream
 	var apiSrv *httptest.Server
 	apiSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+secretToken {
@@ -101,22 +153,33 @@ func TestPrivateRepoAssetDownloadAndCorruptedSHA256Rejection(t *testing.T) {
 		}
 		switch r.URL.Path {
 		case "/repos/shostwp-byte/da-resourcelimiter/releases/latest":
+			assets := []githubAsset{
+				{
+					ID:   101,
+					Name: "da-resource-limiter-linux-amd64.tar.gz",
+					URL:  apiSrv.URL + "/repos/shostwp-byte/da-resourcelimiter/releases/assets/101",
+				},
+				{
+					ID:   102,
+					Name: "checksums.txt",
+					URL:  apiSrv.URL + "/repos/shostwp-byte/da-resourcelimiter/releases/assets/102",
+				},
+			}
+			modeMu.Lock()
+			noSig := omitSigAsset
+			modeMu.Unlock()
+			if !noSig {
+				assets = append(assets, githubAsset{
+					ID:   103,
+					Name: "checksums.txt.sig",
+					URL:  apiSrv.URL + "/repos/shostwp-byte/da-resourcelimiter/releases/assets/103",
+				})
+			}
 			rel := githubRelease{
 				TagName:     "v1.2.0",
 				PublishedAt: "2026-11-04T12:00:00Z",
 				Body:        "Security & performance improvements",
-				Assets: []githubAsset{
-					{
-						ID:   101,
-						Name: "da-resource-limiter-linux-amd64.tar.gz",
-						URL:  apiSrv.URL + "/repos/shostwp-byte/da-resourcelimiter/releases/assets/101",
-					},
-					{
-						ID:   102,
-						Name: "checksums.txt",
-						URL:  apiSrv.URL + "/repos/shostwp-byte/da-resourcelimiter/releases/assets/102",
-					},
-				},
+				Assets:      assets,
 			}
 			_ = json.NewEncoder(w).Encode(rel)
 
@@ -129,6 +192,9 @@ func TestPrivateRepoAssetDownloadAndCorruptedSHA256Rejection(t *testing.T) {
 
 		case "/repos/shostwp-byte/da-resourcelimiter/releases/assets/102":
 			http.Redirect(w, r, cdnSrv.URL+"/blob/checksums", http.StatusFound)
+
+		case "/repos/shostwp-byte/da-resourcelimiter/releases/assets/103":
+			http.Redirect(w, r, cdnSrv.URL+"/blob/checksums.sig", http.StatusFound)
 
 		default:
 			http.NotFound(w, r)
@@ -153,17 +219,18 @@ func TestPrivateRepoAssetDownloadAndCorruptedSHA256Rejection(t *testing.T) {
 	svc.StagingRoot = filepath.Join(tmp, "staging")
 	svc.JobStatusPath = filepath.Join(tmp, "update_status.json")
 	svc.Arch = "amd64"
+	svc.ReleasePublicKeyHex = pubHex
 	svc.LaunchDetached = func(scriptPath string, args ...string) error {
 		launchedArgs = append([]string{scriptPath}, args...)
 		return nil
 	}
 
-	// TC-06: Private Repo Check + TriggerUpdate succeeds with verified SHA-256
+	// 1. CheckLatest + Valid Ed25519 + SHA-256 TriggerUpdate succeeds
 	st, err := svc.CheckLatest(context.Background())
 	if err != nil {
 		t.Fatalf("CheckLatest: %v", err)
 	}
-	if !st.UpdateAvailable || st.LatestVersion != "v1.2.0" {
+	if !st.UpdateAvailable || st.LatestVersion != "v1.2.0" || !st.RepoPinned || !st.SignatureRequired {
 		t.Fatalf("unexpected CheckLatest status: %+v", st)
 	}
 
@@ -177,9 +244,46 @@ func TestPrivateRepoAssetDownloadAndCorruptedSHA256Rejection(t *testing.T) {
 		t.Fatalf("expected extracted binary in staging dir: %v", err)
 	}
 
-	// TC-07: Corrupted SHA-256 must be rejected before launching update.sh
-	corruptChecksumMode = true
+	// 2. Concurrent TriggerUpdate while job status is "running" must be rejected (R3)
+	if _, err := svc.TriggerUpdate(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "currently running") {
+		t.Fatalf("expected concurrent TriggerUpdate while job is running to fail, got err=%v", err)
+	}
+
+	// Mark previous job finished before testing signature/checksum rejection cases
+	svc.writeJobStatus("idle", "ready", "")
+
+	// 3. Forged Ed25519 signature must fail closed before downloading/launching update.sh (S1)
+	modeMu.Lock()
+	forgedSigMode = true
+	modeMu.Unlock()
 	launchedArgs = nil
+	if _, err := svc.TriggerUpdate(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "Ed25519") {
+		t.Fatalf("expected forged Ed25519 signature rejection, got err=%v", err)
+	}
+	if len(launchedArgs) != 0 {
+		t.Fatalf("update.sh must NEVER run on forged Ed25519 signature")
+	}
+
+	// 4. Missing checksums.txt.sig asset must fail closed (S1)
+	modeMu.Lock()
+	forgedSigMode = false
+	omitSigAsset = true
+	modeMu.Unlock()
+	svc.mu.Lock()
+	svc.cachedRel = nil
+	svc.mu.Unlock()
+	if _, err := svc.TriggerUpdate(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "missing checksums.txt.sig") {
+		t.Fatalf("expected missing checksums.txt.sig rejection, got err=%v", err)
+	}
+
+	// 5. Valid Ed25519 signature over mismatched archive SHA-256 must fail closed (TC-07)
+	modeMu.Lock()
+	omitSigAsset = false
+	corruptChecksumMode = true
+	modeMu.Unlock()
+	svc.mu.Lock()
+	svc.cachedRel = nil
+	svc.mu.Unlock()
 	if _, err := svc.TriggerUpdate(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "SHA-256 verification failed") {
 		t.Fatalf("expected SHA-256 verification failure, got err=%v", err)
 	}

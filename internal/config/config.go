@@ -13,7 +13,11 @@ import (
 	"github.com/shostwp-byte/da-resourcelimiter/internal/version"
 )
 
-var safeIdentifierRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
+var (
+	safeIdentifierRe    = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
+	githubRepoSegmentRe = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,100}$`)
+	releaseTagRe        = regexp.MustCompile(`^v?[0-9]+\.[0-9]+(\.[0-9]+){0,2}(-[0-9A-Za-z.-]{1,64})?$`)
+)
 
 // ResourceLimits holds per-package or per-user OS, PHP-FPM, and MariaDB limits.
 type ResourceLimits struct {
@@ -22,12 +26,12 @@ type ResourceLimits struct {
 	Package        string `json:"package,omitempty"`
 
 	// OS Layer (Cgroups v2 / systemd slice)
-	CPUQuota   int `json:"cpu_quota"`   // Percentage: 100 = 1 vCore, 150 = 1.5 vCores
-	CPUWeight  int `json:"cpu_weight"`  // 1..10000 (default 100)
-	MemHighMB  int `json:"mem_high_mb"` // Throttle threshold in MB
-	MemMaxMB   int `json:"mem_max_mb"`  // Hard OOM limit in MB
-	IOWeight   int `json:"io_weight"`   // 1..10000 (default 100)
-	TasksMax   int `json:"tasks_max"`   // Max processes + threads (fork bomb guard)
+	CPUQuota  int `json:"cpu_quota"`   // Percentage: 100 = 1 vCore, 150 = 1.5 vCores
+	CPUWeight int `json:"cpu_weight"`  // 1..10000 (default 100)
+	MemHighMB int `json:"mem_high_mb"` // Throttle threshold in MB
+	MemMaxMB  int `json:"mem_max_mb"`  // Hard OOM limit in MB
+	IOWeight  int `json:"io_weight"`   // 1..10000 (default 100)
+	TasksMax  int `json:"tasks_max"`   // Max processes + threads (fork bomb guard)
 
 	// PHP-FPM / LSPHP Layer
 	PHPMaxChildren int `json:"php_max_children"`
@@ -72,7 +76,9 @@ func DefaultLimits() ResourceLimits {
 	}
 }
 
-// Validate checks bounds and cross-field constraints before applying limits to Kernel or MariaDB.
+// Validate checks bounds and cross-field constraints (including MySQL Penalty Box bounds)
+// before applying limits to Kernel or MariaDB. Note: 0 is rejected for penalty conn/time
+// because MariaDB interprets 0 as "unlimited" (R2).
 func (r ResourceLimits) Validate() error {
 	if r.CPUQuota < 10 || r.CPUQuota > 12800 {
 		return fmt.Errorf("CPU_QUOTA must be between 10 and 12800 (got %d)", r.CPUQuota)
@@ -110,6 +116,21 @@ func (r ResourceLimits) Validate() error {
 	if r.MySQLMaxStatementTime < 1 || r.MySQLMaxStatementTime > 86400 {
 		return fmt.Errorf("MYSQL_MAX_STATEMENT_TIME_SEC must be between 1 and 86400 (got %d)", r.MySQLMaxStatementTime)
 	}
+	if r.MySQLPenaltyThreshold < 1 || r.MySQLPenaltyThreshold > 1000 {
+		return fmt.Errorf("MYSQL_PENALTY_THRESHOLD must be between 1 and 1000 (got %d)", r.MySQLPenaltyThreshold)
+	}
+	if r.MySQLPenaltyWindowSec < 5 || r.MySQLPenaltyWindowSec > 86400 {
+		return fmt.Errorf("MYSQL_PENALTY_WINDOW_SEC must be between 5 and 86400 (got %d)", r.MySQLPenaltyWindowSec)
+	}
+	if r.MySQLPenaltyDurationSec < 10 || r.MySQLPenaltyDurationSec > 86400 {
+		return fmt.Errorf("MYSQL_PENALTY_DURATION_SEC must be between 10 and 86400 (got %d)", r.MySQLPenaltyDurationSec)
+	}
+	if r.MySQLPenaltyConn < 1 || r.MySQLPenaltyConn > r.MySQLMaxConnections {
+		return fmt.Errorf("MYSQL_PENALTY_CONN (%d) must be >= 1 and <= MYSQL_MAX_CONNECTIONS (%d)", r.MySQLPenaltyConn, r.MySQLMaxConnections)
+	}
+	if r.MySQLPenaltyTimeSec < 1 || r.MySQLPenaltyTimeSec > r.MySQLMaxStatementTime {
+		return fmt.Errorf("MYSQL_PENALTY_TIME_SEC (%d) must be >= 1 and <= MYSQL_MAX_STATEMENT_TIME_SEC (%d)", r.MySQLPenaltyTimeSec, r.MySQLMaxStatementTime)
+	}
 	return nil
 }
 
@@ -119,6 +140,7 @@ type UpdaterConfig struct {
 	GitHubToken     string `json:"-"` // Never serialized raw in public JSON responses
 	UpdateChannel   string `json:"update_channel"`
 	BackupRetention int    `json:"backup_retention"`
+	AllowCustomRepo bool   `json:"-"` // Root-only disk override flag; never modifiable via IPC
 }
 
 func DefaultUpdaterConfig() UpdaterConfig {
@@ -127,6 +149,7 @@ func DefaultUpdaterConfig() UpdaterConfig {
 		GitHubToken:     "",
 		UpdateChannel:   "stable",
 		BackupRetention: 5,
+		AllowCustomRepo: false,
 	}
 }
 
@@ -145,6 +168,30 @@ func (u UpdaterConfig) MaskedToken() string {
 func ValidateIdentifier(name string) error {
 	if !safeIdentifierRe.MatchString(name) || strings.Contains(name, "..") {
 		return fmt.Errorf("invalid identifier %q", name)
+	}
+	return nil
+}
+
+// ValidateGitHubRepo strictly validates "owner/repo" syntax, rejecting query strings,
+// URL encoding, whitespace, or "." / ".." traversal segments (S6).
+func ValidateGitHubRepo(repo string) error {
+	parts := strings.Split(strings.TrimSpace(repo), "/")
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid GitHub repository %q (expected owner/repo)", repo)
+	}
+	for _, seg := range parts {
+		if seg == "." || seg == ".." || !githubRepoSegmentRe.MatchString(seg) {
+			return fmt.Errorf("invalid GitHub repository segment in %q", repo)
+		}
+	}
+	return nil
+}
+
+// ValidateReleaseTag validates release version tags (e.g. v1.0.4, v1.0.4.1, v1.1.0-beta.1) (S6, S7).
+func ValidateReleaseTag(tag string) error {
+	trimmed := strings.TrimSpace(tag)
+	if trimmed == "" || strings.Contains(trimmed, "..") || !releaseTagRe.MatchString(trimmed) {
+		return fmt.Errorf("invalid release tag %q", tag)
 	}
 	return nil
 }
@@ -312,7 +359,8 @@ func (s *Store) UserConfPath(username string) (string, error) {
 	return filepath.Join(s.DataDir, "users", username+".conf"), nil
 }
 
-// ResolveUserLimits resolves effective limits using Default -> Package -> User Override hierarchy.
+// ResolveUserLimits resolves effective limits using Default -> Package -> User Override hierarchy
+// and validates all fields (including MySQL Penalty bounds) before returning (R2).
 func (s *Store) ResolveUserLimits(username, packageName string) (ResourceLimits, error) {
 	limits := DefaultLimits()
 
@@ -343,6 +391,9 @@ func (s *Store) ResolveUserLimits(username, packageName string) (ResourceLimits,
 		return limits, fmt.Errorf("read user %s: %w", username, err)
 	}
 
+	if err := limits.Validate(); err != nil {
+		return limits, fmt.Errorf("invalid resolved limits for %q: %w", username, err)
+	}
 	return limits, nil
 }
 
@@ -438,8 +489,19 @@ func (s *Store) LoadUpdaterConfig() (UpdaterConfig, error) {
 	if err != nil {
 		return cfg, err
 	}
-	if v := strings.TrimSpace(kv["GITHUB_REPO"]); v != "" {
-		cfg.GitHubRepo = v
+	if v, ok := kv["ALLOW_CUSTOM_REPO"]; ok {
+		cfg.AllowCustomRepo = parseBool(v, false)
+	}
+	// Pin GitHubRepo to compiled-in DefaultGitHubRepo unless root explicitly set ALLOW_CUSTOM_REPO=yes in 0600 updater.conf (S1)
+	if cfg.AllowCustomRepo {
+		if v := strings.TrimSpace(kv["GITHUB_REPO"]); v != "" {
+			if err := ValidateGitHubRepo(v); err != nil {
+				return cfg, err
+			}
+			cfg.GitHubRepo = v
+		}
+	} else {
+		cfg.GitHubRepo = version.DefaultGitHubRepo
 	}
 	if v, ok := kv["GITHUB_TOKEN"]; ok {
 		cfg.GitHubToken = strings.TrimSpace(v)
@@ -460,8 +522,15 @@ func (s *Store) SaveUpdaterConfig(cfg UpdaterConfig) error {
 		return errors.New("updater config path not configured")
 	}
 	repo := strings.TrimSpace(cfg.GitHubRepo)
-	if !strings.Contains(repo, "/") || strings.Contains(repo, "..") || strings.ContainsAny(repo, " \t\r\n") {
-		return fmt.Errorf("invalid GitHub repository format %q (expected owner/repo)", repo)
+	if repo == "" || !cfg.AllowCustomRepo {
+		repo = version.DefaultGitHubRepo
+	}
+	if err := ValidateGitHubRepo(repo); err != nil {
+		return err
+	}
+	token := strings.TrimSpace(cfg.GitHubToken)
+	if strings.ContainsAny(token, "\r\n") {
+		return errors.New("invalid characters in GitHub token")
 	}
 	channel := strings.ToLower(strings.TrimSpace(cfg.UpdateChannel))
 	if channel != "stable" && channel != "beta" {
@@ -475,7 +544,10 @@ func (s *Store) SaveUpdaterConfig(cfg UpdaterConfig) error {
 	var b strings.Builder
 	b.WriteString("# DA-ResourceLimiter GitHub Updater Configuration (0600 root:root)\n")
 	fmt.Fprintf(&b, "GITHUB_REPO=%s\n", repo)
-	fmt.Fprintf(&b, "GITHUB_TOKEN=%s\n", strings.TrimSpace(cfg.GitHubToken))
+	if cfg.AllowCustomRepo {
+		b.WriteString("ALLOW_CUSTOM_REPO=yes\n")
+	}
+	fmt.Fprintf(&b, "GITHUB_TOKEN=%s\n", token)
 	fmt.Fprintf(&b, "UPDATE_CHANNEL=%s\n", channel)
 	fmt.Fprintf(&b, "BACKUP_RETENTION=%d\n", retention)
 

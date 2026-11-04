@@ -1,6 +1,7 @@
 BINARY_NAME := da-resourced
 MODULE      := github.com/shostwp-byte/da-resourcelimiter
-VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "v0.1.0-dev")
+CONF_VER    := $(shell awk -F= '/^version=/{print "v"$$2}' plugin/plugin.conf 2>/dev/null || echo "v1.0.4.1")
+VERSION     ?= $(CONF_VER)
 COMMIT      ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "none")
 BUILD_TIME  ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "unknown")
 
@@ -9,9 +10,9 @@ LDFLAGS := -s -w \
 	-X '$(MODULE)/internal/version.Commit=$(COMMIT)' \
 	-X '$(MODULE)/internal/version.BuildTime=$(BUILD_TIME)'
 
-.PHONY: all build build-linux-amd64 build-linux-arm64 test vet clean
+.PHONY: all build build-linux-amd64 build-linux-arm64 test vet fmt-check clean
 
-all: vet test build
+all: fmt-check vet test build
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/$(BINARY_NAME) ./cmd/da-resourced
@@ -27,6 +28,9 @@ test:
 
 vet:
 	go vet ./...
+
+fmt-check:
+	@test -z "$$(gofmt -l .)" || (echo "Unformatted Go files:"; gofmt -l .; exit 1)
 
 clean:
 	rm -rf bin/ dist/

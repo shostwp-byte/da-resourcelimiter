@@ -10,13 +10,29 @@ STAGE_DIR="${2:-}"
 TARGET_VER="${3:-unknown}"
 RETENTION="${4:-5}"
 
-BIN_DEST="/usr/local/sbin/da-resourced"
-PLUGIN_DEST="/usr/local/directadmin/plugins/da_resource_limiter"
-DA_CUSTOM_HOOKS="/usr/local/directadmin/scripts/custom"
-SYSTEMD_UNIT="/etc/systemd/system/da-resourced.service"
-BACKUP_DIR="/var/backups/da-resource-limiter"
-STATUS_FILE="/var/lib/da-resourced/update_status.json"
-LOCK_FILE="/var/lock/da-limiter-update.lock"
+BIN_DEST="${DA_LIMITER_BIN_DEST:-/usr/local/sbin/da-resourced}"
+PLUGIN_DEST="${DA_LIMITER_PLUGIN_DEST:-/usr/local/directadmin/plugins/da_resource_limiter}"
+DA_CUSTOM_HOOKS="${DA_LIMITER_CUSTOM_HOOKS:-/usr/local/directadmin/scripts/custom}"
+SYSTEMD_UNIT="${DA_LIMITER_SYSTEMD_UNIT:-/etc/systemd/system/da-resourced.service}"
+BACKUP_DIR="${DA_LIMITER_BACKUP_DIR:-/var/backups/da-resource-limiter}"
+STATUS_FILE="${DA_LIMITER_STATUS_FILE:-/var/lib/da-resourced/update_status.json}"
+STAGING_ROOT="${DA_LIMITER_STAGING_ROOT:-/var/lib/da-resourced/staging}"
+LOCK_FILE="${DA_LIMITER_LOCK_FILE:-/var/lock/da-limiter-update.lock}"
+
+is_valid_semver_tag() {
+    local tag="$1"
+    [[ "$tag" =~ ^[vV]?[0-9]+\.[0-9]+(\.[0-9]+){0,2}(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]
+}
+
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
 
 write_status() {
     local state="$1"
@@ -25,17 +41,50 @@ write_status() {
     local ts
     ts=$(date -u +%s)
     mkdir -p "$(dirname "$STATUS_FILE")"
-    local escaped_msg="${msg//\\/\\\\}"
-    escaped_msg="${escaped_msg//\"/\\\"}"
+    local escaped_state escaped_msg escaped_ver
+    escaped_state=$(json_escape "$state")
+    escaped_msg=$(json_escape "$msg")
+    escaped_ver=$(json_escape "$ver")
     cat <<EOF > "${STATUS_FILE}.tmp"
 {
-  "state": "${state}",
+  "state": "${escaped_state}",
   "message": "${escaped_msg}",
-  "target_version": "${ver}",
+  "target_version": "${escaped_ver}",
   "updated_unix": ${ts}
 }
 EOF
     mv -f "${STATUS_FILE}.tmp" "$STATUS_FILE"
+}
+
+# Safely remove the entire stage container directory (/var/lib/da-resourced/staging/<tag-nonce>)
+# ONLY when STAGE_DIR resolves strictly inside STAGING_ROOT (S7, R9).
+cleanup_stage_dir() {
+    local target="$1"
+    if [[ -z "$target" || ! -e "$target" ]]; then
+        return 0
+    fi
+    local real_root real_stage
+    real_root=$(readlink -f -- "$STAGING_ROOT" 2>/dev/null || true)
+    real_stage=$(readlink -f -- "$target" 2>/dev/null || true)
+    if [[ -z "$real_root" || -z "$real_stage" || "$real_root" == "/" ]]; then
+        return 0
+    fi
+    case "$real_stage" in
+        "${real_root}/"*)
+            local rel_sub="${real_stage#"${real_root}/"}"
+            local first_seg="${rel_sub%%/*}"
+            if [[ -n "$first_seg" && "$first_seg" != "." && "$first_seg" != ".." ]]; then
+                local container_dir="${real_root}/${first_seg}"
+                if [[ "$container_dir" == "${real_root}/"* && "$container_dir" != "$real_root" ]]; then
+                    rm -rf -- "$container_dir" 2>/dev/null || true
+                fi
+            fi
+            ;;
+        *)
+            # Stage directory is outside STAGING_ROOT (e.g. manual invocation); never delete parent paths.
+            return 0
+            ;;
+    esac
 }
 
 fix_permissions() {
@@ -113,7 +162,7 @@ create_snapshot_backup() {
     chmod 0700 "$BACKUP_DIR"
     local ts
     ts=$(date -u +"%Y%m%dT%H%M%SZ")
-    local snap_stage="${BACKUP_DIR}/.stage-${ts}"
+    local snap_stage="${BACKUP_DIR}/.stage-${ts}-$$"
     local snap_archive="${BACKUP_DIR}/snapshot-${ts}.tar.gz"
 
     rm -rf "$snap_stage"
@@ -198,11 +247,17 @@ fi
 
 case "$MODE" in
     apply)
+        if ! is_valid_semver_tag "$TARGET_VER"; then
+            write_status "failed" "Invalid release version tag: ${TARGET_VER}" "invalid"
+            echo "Refusing update with invalid version tag: ${TARGET_VER}" >&2
+            exit 1
+        fi
         if [[ -z "$STAGE_DIR" || ! -d "$STAGE_DIR" ]]; then
             write_status "failed" "Staging directory missing: ${STAGE_DIR}" "$TARGET_VER"
             exit 1
         fi
         if [[ ! -f "${STAGE_DIR}/bin/da-resourced" ]]; then
+            cleanup_stage_dir "$STAGE_DIR"
             write_status "failed" "Staged binary missing at ${STAGE_DIR}/bin/da-resourced" "$TARGET_VER"
             exit 1
         fi
@@ -226,8 +281,12 @@ case "$MODE" in
         done
         if [[ -f "${STAGE_DIR}/plugin/plugin.conf" ]]; then
             cp -a "${STAGE_DIR}/plugin/plugin.conf" "${PLUGIN_DEST}/plugin.conf"
-            clean_ver="${TARGET_VER#v}"
-            sed -i "s/^version=.*/version=${clean_ver}/" "${PLUGIN_DEST}/plugin.conf" || true
+            clean_ver="${TARGET_VER#[vV]}"
+            CLEAN_VER="$clean_ver" awk '
+                /^version=/ { print "version=" ENVIRON["CLEAN_VER"]; next }
+                { print }
+            ' "${PLUGIN_DEST}/plugin.conf" > "${PLUGIN_DEST}/plugin.conf.tmp" \
+                && mv -f "${PLUGIN_DEST}/plugin.conf.tmp" "${PLUGIN_DEST}/plugin.conf"
         fi
         if [[ -f "${STAGE_DIR}/plugin/data/default.conf.example" ]]; then
             cp -a "${STAGE_DIR}/plugin/data/default.conf.example" "${PLUGIN_DEST}/data/default.conf.example"
@@ -245,11 +304,12 @@ case "$MODE" in
         write_status "running" "Restarting da-resourced & running 10s socket healthcheck..." "$TARGET_VER"
         systemctl daemon-reload
         if systemctl restart da-resourced && healthcheck_daemon; then
-            rm -rf "$(dirname "$STAGE_DIR")" 2>/dev/null || true
+            cleanup_stage_dir "$STAGE_DIR"
             write_status "success" "Successfully updated to ${TARGET_VER} (snapshot saved at ${SNAP_FILE})" "$TARGET_VER"
             echo "Update to ${TARGET_VER} succeeded."
             exit 0
         else
+            cleanup_stage_dir "$STAGE_DIR"
             write_status "running" "Healthcheck failed for ${TARGET_VER}; executing automatic rollback..." "$TARGET_VER"
             if restore_snapshot_archive "$SNAP_FILE" && healthcheck_daemon; then
                 write_status "rolled_back" "Update to ${TARGET_VER} failed healthcheck; automatically rolled back to previous working snapshot." "$TARGET_VER"

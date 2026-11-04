@@ -2,7 +2,7 @@
 # 1-Click Production Installer for DA-ResourceLimiter
 # Supports:
 #   1) Running from an extracted release archive (./scripts/install.sh)
-#   2) Remote 1-line bootstrap from GitHub Releases (Public or Private repo via GITHUB_TOKEN)
+#   2) Remote bootstrap from verified GitHub Releases (Public or Private repo via GITHUB_TOKEN)
 
 set -euo pipefail
 
@@ -23,10 +23,24 @@ ok()    { printf '\033[1;32m[OK]\033[0m    %s\n' "$*"; }
 warn()  { printf '\033[1;33m[WARN]\033[0m  %s\n' "$*"; }
 fatal() { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 
+validate_inputs() {
+    if [[ ! "$GITHUB_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || [[ "$GITHUB_REPO" == *".."* ]]; then
+        fatal "Invalid GITHUB_REPO format: ${GITHUB_REPO} (expected owner/repo)."
+    fi
+    if [[ "$TARGET_VERSION" != "latest" ]] && [[ ! "$TARGET_VERSION" =~ ^[vV]?[0-9]+\.[0-9]+(\.[0-9]+){0,2}(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+        fatal "Invalid TARGET_VERSION format: ${TARGET_VERSION} (expected 'latest' or vX.Y.Z)."
+    fi
+    if [[ "$GITHUB_TOKEN" == *$'\n'* || "$GITHUB_TOKEN" == *$'\r'* ]]; then
+        fatal "GITHUB_TOKEN must not contain newline characters."
+    fi
+}
+
 check_prerequisites() {
     if [[ "$(id -u)" -ne 0 ]]; then
         fatal "install.sh must be executed as root."
     fi
+
+    validate_inputs
 
     if [[ ! -d "/usr/local/directadmin" ]]; then
         fatal "DirectAdmin installation not found at /usr/local/directadmin."
@@ -48,10 +62,10 @@ check_prerequisites() {
     local da_mycnf="/usr/local/directadmin/conf/my.cnf"
     if command -v mysql >/dev/null 2>&1 && [[ -f "$da_mycnf" ]]; then
         local db_ver=""
-        db_ver=$(mysql --defaults-extra-file="$da_mycnf" -N -B -e "SELECT VERSION();" 2>/dev/null || true)
+        db_ver=$(mysql --defaults-extra-file="$da_mycnf" --connect-timeout=3 -N -B -e "SELECT VERSION();" 2>/dev/null || true)
         if [[ -n "$db_ver" ]]; then
             info "Detected Database Engine: ${db_ver}"
-            if ! mysql --defaults-extra-file="$da_mycnf" -N -B -e "SELECT MEMORY_USED FROM information_schema.PROCESSLIST LIMIT 1;" >/dev/null 2>&1; then
+            if ! mysql --defaults-extra-file="$da_mycnf" --connect-timeout=3 -N -B -e "SELECT MEMORY_USED FROM information_schema.PROCESSLIST LIMIT 1;" >/dev/null 2>&1; then
                 if [[ "$FORCE_DB" != "yes" ]]; then
                     warn "Database does not expose information_schema.PROCESSLIST.MEMORY_USED (MariaDB 10.5+ recommended)."
                     fatal "Upgrade to MariaDB 10.6/10.11 LTS via CustomBuild, or re-run with FORCE_DB=yes to run in thread/time-only mode."
@@ -73,6 +87,13 @@ detect_arch() {
         aarch64|arm64) echo "arm64" ;;
         *) fatal "Unsupported CPU architecture: ${machine}" ;;
     esac
+}
+
+# Emit curl -K config line over stdin so GITHUB_TOKEN is never exposed in /proc/<pid>/cmdline (S4).
+emit_curl_auth_config() {
+    local escaped="${GITHUB_TOKEN//\\/\\\\}"
+    escaped="${escaped//\"/\\\"}"
+    printf 'header = "Authorization: Bearer %s"\n' "$escaped"
 }
 
 extract_asset_api_url() {
@@ -126,10 +147,9 @@ download_github_asset() {
     fi
 
     # For Private Repositories: GitHub Asset API responds with HTTP 302 to signed CDN storage.
-    # Strip Authorization header before following the cross-host redirect to avoid S3/Azure HTTP 400.
+    # Pass Authorization exclusively via `curl -K -` stdin and strip before cross-host redirect.
     local hdr_file="${dest_file}.headers"
-    curl -fsS \
-        -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+    emit_curl_auth_config | curl -fsS -K - \
         -H "Accept: application/octet-stream" \
         -H "X-GitHub-Api-Version: 2022-11-28" \
         -D "$hdr_file" -o "$dest_file" "$asset_api_url" || true
@@ -156,20 +176,23 @@ bootstrap_from_github() {
     fi
 
     info "Fetching release metadata from ${GITHUB_REPO} (${TARGET_VERSION})..."
-    local curl_auth=()
+    local rel_json="${work_dir}/release.json"
     if [[ -n "$GITHUB_TOKEN" ]]; then
-        curl_auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+        emit_curl_auth_config | curl -fsSL -K - \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$api_url" -o "$rel_json"
+    else
+        curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$api_url" -o "$rel_json"
     fi
 
-    local rel_json="${work_dir}/release.json"
-    curl -fsSL "${curl_auth[@]}" \
-        -H "Accept: application/vnd.github+json" \
-        -H "X-GitHub-Api-Version: 2022-11-28" \
-        "$api_url" -o "$rel_json"
-
-    local archive_asset_url checksum_asset_url
+    local archive_asset_url checksum_asset_url sig_asset_url
     archive_asset_url=$(extract_asset_api_url "$rel_json" "$archive_name")
     checksum_asset_url=$(extract_asset_api_url "$rel_json" "checksums.txt")
+    sig_asset_url=$(extract_asset_api_url "$rel_json" "checksums.txt.sig")
 
     if [[ -z "$archive_asset_url" || -z "$checksum_asset_url" ]]; then
         fatal "Could not locate ${archive_name} or checksums.txt in GitHub Release."
@@ -177,9 +200,12 @@ bootstrap_from_github() {
 
     info "Downloading checksums.txt & ${archive_name}..."
     download_github_asset "$checksum_asset_url" "${work_dir}/checksums.txt"
+    if [[ -n "$sig_asset_url" ]]; then
+        download_github_asset "$sig_asset_url" "${work_dir}/checksums.txt.sig"
+    fi
     download_github_asset "$archive_asset_url" "${work_dir}/${archive_name}"
 
-    info "Verifying SHA-256 signature..."
+    info "Verifying SHA-256 checksum..."
     (
         cd "$work_dir"
         grep " ${archive_name}\$" checksums.txt | sha256sum -c -
@@ -187,10 +213,70 @@ bootstrap_from_github() {
     ok "SHA-256 checksum verified."
 
     tar -xzf "${work_dir}/${archive_name}" -C "$work_dir"
+
+    if [[ -f "${work_dir}/checksums.txt.sig" ]]; then
+        info "Verifying Ed25519 release signature..."
+        "${work_dir}/da-resource-limiter/bin/da-resourced" verify \
+            "${work_dir}/checksums.txt" "${work_dir}/checksums.txt.sig"
+        ok "Ed25519 release signature verified."
+    fi
+}
+
+update_token_in_conf() {
+    local conf_file="$1"
+    local tmp_conf
+    tmp_conf=$(mktemp "${conf_file}.tmp.XXXXXX")
+    chmod 0600 "$tmp_conf"
+    chown root:root "$tmp_conf"
+    GITHUB_TOKEN="$GITHUB_TOKEN" awk '
+        BEGIN { updated = 0 }
+        /^GITHUB_TOKEN=/ {
+            print "GITHUB_TOKEN=" ENVIRON["GITHUB_TOKEN"]
+            updated = 1
+            next
+        }
+        { print }
+        END {
+            if (!updated) {
+                print "GITHUB_TOKEN=" ENVIRON["GITHUB_TOKEN"]
+            }
+        }
+    ' "$conf_file" > "$tmp_conf"
+    mv -f "$tmp_conf" "$conf_file"
+    chmod 0600 "$conf_file"
+    chown root:root "$conf_file"
+}
+
+verify_bundle_completeness() {
+    local bundle_dir="$1"
+    local req_files=(
+        "bin/da-resourced"
+        "plugin/plugin.conf"
+        "plugin/admin/index.html"
+        "plugin/admin/api.raw"
+        "plugin/admin/api.php"
+        "plugin/user/index.html"
+        "plugin/user/stats.raw"
+        "plugin/user/stats.php"
+        "plugin/images/admin_icon.svg"
+        "plugin/images/user_icon.svg"
+        "plugin/hooks/admin_img.html"
+        "plugin/hooks/user_img.html"
+        "plugin/data/default.conf.example"
+        "systemd/da-resourced.service"
+    )
+    local rel
+    for rel in "${req_files[@]}"; do
+        if [[ ! -f "${bundle_dir}/${rel}" ]]; then
+            fatal "Release bundle is incomplete (missing ${rel}); refusing installation."
+        fi
+    done
 }
 
 install_from_bundle() {
     local bundle_dir="$1"
+
+    verify_bundle_completeness "$bundle_dir"
 
     info "Installing da-resourced static binary to ${BIN_DEST}..."
     install -o root -g root -m 0755 "${bundle_dir}/bin/da-resourced" "${BIN_DEST}.new"
@@ -207,17 +293,6 @@ install_from_bundle() {
         fi
     done
 
-    # Sync latest Evolution Skin Monitor SVG icons & Widescreen UI if release bundle predates them
-    if [[ ! -f "${bundle_dir}/plugin/images/admin_icon.svg" ]]; then
-        local raw_auth=()
-        [[ -n "$GITHUB_TOKEN" ]] && raw_auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
-        curl -fsSL "${raw_auth[@]}" "https://raw.githubusercontent.com/${GITHUB_REPO}/main/plugin/images/admin_icon.svg" -o "${PLUGIN_DEST}/images/admin_icon.svg" 2>/dev/null || true
-        curl -fsSL "${raw_auth[@]}" "https://raw.githubusercontent.com/${GITHUB_REPO}/main/plugin/images/user_icon.svg" -o "${PLUGIN_DEST}/images/user_icon.svg" 2>/dev/null || true
-        curl -fsSL "${raw_auth[@]}" "https://raw.githubusercontent.com/${GITHUB_REPO}/main/plugin/hooks/admin_img.html" -o "${PLUGIN_DEST}/hooks/admin_img.html" 2>/dev/null || true
-        curl -fsSL "${raw_auth[@]}" "https://raw.githubusercontent.com/${GITHUB_REPO}/main/plugin/hooks/user_img.html" -o "${PLUGIN_DEST}/hooks/user_img.html" 2>/dev/null || true
-        curl -fsSL "${raw_auth[@]}" "https://raw.githubusercontent.com/${GITHUB_REPO}/main/plugin/admin/index.html" -o "${PLUGIN_DEST}/admin/index.html" 2>/dev/null || true
-        curl -fsSL "${raw_auth[@]}" "https://raw.githubusercontent.com/${GITHUB_REPO}/main/plugin/user/index.html" -o "${PLUGIN_DEST}/user/index.html" 2>/dev/null || true
-    fi
     cp -a "${bundle_dir}/plugin/plugin.conf" "${PLUGIN_DEST}/plugin.conf"
     cp -a "${bundle_dir}/plugin/data/default.conf.example" "${PLUGIN_DEST}/data/default.conf.example"
 
@@ -255,10 +330,11 @@ install_from_bundle() {
     chown -R root:root "${PLUGIN_DEST}/scripts"
     chmod 0700 "${PLUGIN_DEST}/scripts"/*.sh
 
-    # Initialize /etc/da-resourced/updater.conf (0600 root:root) if not yet present
+    # Initialize /etc/da-resourced/updater.conf (0600 root:root) without exposing token on cmdline
     mkdir -p "$(dirname "$UPDATER_CONF")"
     chmod 0700 "$(dirname "$UPDATER_CONF")"
     if [[ ! -f "$UPDATER_CONF" ]]; then
+        umask 077
         cat <<EOF > "$UPDATER_CONF"
 # DA-ResourceLimiter GitHub Updater Configuration (0600 root:root)
 GITHUB_REPO=${GITHUB_REPO}
@@ -270,8 +346,7 @@ EOF
         chown root:root "$UPDATER_CONF"
         ok "Created GitHub Updater configuration at ${UPDATER_CONF}"
     elif [[ -n "$GITHUB_TOKEN" ]]; then
-        sed -i "s|^GITHUB_TOKEN=.*|GITHUB_TOKEN=${GITHUB_TOKEN}|" "$UPDATER_CONF"
-        chmod 0600 "$UPDATER_CONF"
+        update_token_in_conf "$UPDATER_CONF"
         ok "Updated GITHUB_TOKEN in ${UPDATER_CONF}"
     fi
 
@@ -294,7 +369,6 @@ EOF
     done
     ok "DirectAdmin lifecycle hooks installed."
 
-    # Check DirectAdmin custom php-fpm.conf note
     if [[ -f "${DA_CUSTOM_TPL_DIR}/php-fpm.conf" ]]; then
         info "Existing ${DA_CUSTOM_TPL_DIR}/php-fpm.conf detected (left untouched). Reference snippet: ${PLUGIN_DEST}/templates/php-fpm.conf.custom"
     else
@@ -347,6 +421,7 @@ if [[ -n "$LOCAL_BUNDLE" ]]; then
 else
     ARCH=$(detect_arch)
     TMP_WORK=$(mktemp -d /tmp/da-limiter-install.XXXXXX)
+    chmod 0700 "$TMP_WORK"
     trap '[[ -n "${TMP_WORK:-}" ]] && rm -rf "$TMP_WORK"' EXIT
     bootstrap_from_github "$ARCH" "$TMP_WORK"
     install_from_bundle "${TMP_WORK}/da-resource-limiter"

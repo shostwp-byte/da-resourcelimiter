@@ -21,6 +21,24 @@ import (
 
 const DefaultPenaltyStatePath = "/var/lib/da-resourced/penalty_state.json"
 
+var protectedMySQLAccounts = map[string]struct{}{
+	"root":             {},
+	"da_admin":         {},
+	"mysql":            {},
+	"mariadb.sys":      {},
+	"mysql.sys":        {},
+	"mysql.session":    {},
+	"mysql.infoschema": {},
+	"system user":      {},
+	"event_scheduler":  {},
+	"public":           {},
+}
+
+func isProtectedDBUser(dbUser string) bool {
+	_, blocked := protectedMySQLAccounts[strings.ToLower(strings.TrimSpace(dbUser))]
+	return blocked
+}
+
 // LiveUserMySQLUsage stores the latest real-time MariaDB snapshot for a single DirectAdmin user.
 type LiveUserMySQLUsage struct {
 	MemoryBytes      uint64
@@ -134,28 +152,92 @@ func (g *Governor) ActivePenalties() []PenaltyEntry {
 	return out
 }
 
+func (g *Governor) effectiveMySQLCaps(daUsername string, limits config.ResourceLimits) (maxConn int, maxTime int) {
+	if !limits.Enabled {
+		return 0, 0
+	}
+	maxConn = limits.MySQLMaxConnections
+	maxTime = limits.MySQLMaxStatementTime
+
+	g.mu.RLock()
+	p, penalized := g.penalties[daUsername]
+	g.mu.RUnlock()
+	if penalized && g.NowFunc().Unix() < p.ExpiresUnix {
+		maxConn = limits.MySQLPenaltyConn
+		maxTime = limits.MySQLPenaltyTimeSec
+	}
+
+	// Defense-in-depth: never pass 0 (MariaDB "unlimited") when limits.Enabled is true (R2)
+	if maxConn < 1 {
+		maxConn = 1
+	}
+	if maxTime < 1 {
+		maxTime = 1
+	}
+	return maxConn, maxTime
+}
+
 // ApplyUserAccountLimits (Tier 2) enforces MAX_USER_CONNECTIONS and MAX_STATEMENT_TIME on all DB users owned by daUsername.
 func (g *Governor) ApplyUserAccountLimits(ctx context.Context, daUsername string, limits config.ResourceLimits) error {
 	if err := config.ValidateIdentifier(daUsername); err != nil {
 		return err
 	}
+	if isProtectedDBUser(daUsername) {
+		return fmt.Errorf("refusing to apply MariaDB limits to protected account %q", daUsername)
+	}
+	maxConn, maxTime := g.effectiveMySQLCaps(daUsername, limits)
+	return g.alterAllDBUsersForSystemUser(ctx, daUsername, maxConn, maxTime)
+}
 
-	maxConn := 0
-	maxTime := 0
-	if limits.Enabled {
-		maxConn = limits.MySQLMaxConnections
-		maxTime = limits.MySQLMaxStatementTime
-
-		g.mu.RLock()
-		p, penalized := g.penalties[daUsername]
-		g.mu.RUnlock()
-		if penalized && g.NowFunc().Unix() < p.ExpiresUnix {
-			maxConn = limits.MySQLPenaltyConn
-			maxTime = limits.MySQLPenaltyTimeSec
-		}
+// ApplyBatchUserLimits synchronizes MariaDB Tier-2 limits for all supplied DirectAdmin accounts
+// in a single SELECT + single batched ALTER USER execution instead of 2*N mysql invocations (R4).
+func (g *Governor) ApplyBatchUserLimits(ctx context.Context, limitsByUser map[string]config.ResourceLimits) error {
+	if len(limitsByUser) == 0 || g.Registry == nil {
+		return nil
 	}
 
-	return g.alterAllDBUsersForSystemUser(ctx, daUsername, maxConn, maxTime)
+	rows, err := g.Runner.QueryTSV(ctx,
+		"SELECT User, Host FROM mysql.user WHERE User NOT IN ('root', 'da_admin', 'mysql', 'mariadb.sys', 'mysql.sys', 'mysql.session', 'mysql.infoschema', 'PUBLIC');",
+	)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+
+	var batch strings.Builder
+	count := 0
+	for _, line := range rows {
+		parts := strings.Split(line, "\t")
+		if len(parts) < 2 {
+			continue
+		}
+		u := strings.TrimSpace(parts[0])
+		h := strings.TrimSpace(parts[1])
+		if u == "" || h == "" || isProtectedDBUser(u) {
+			continue
+		}
+		acct, matched := g.Registry.ResolveDBUser(u)
+		if !matched {
+			continue
+		}
+		limits, wantSync := limitsByUser[acct.Username]
+		if !wantSync {
+			continue
+		}
+		maxConn, maxTime := g.effectiveMySQLCaps(acct.Username, limits)
+		fmt.Fprintf(&batch,
+			"ALTER USER '%s'@'%s' WITH MAX_USER_CONNECTIONS %d MAX_STATEMENT_TIME %d;\n",
+			escapeSQLString(u), escapeSQLString(h), maxConn, maxTime,
+		)
+		count++
+	}
+	if count == 0 {
+		return nil
+	}
+	batch.WriteString("FLUSH USER_RESOURCES;\n")
+	return g.Runner.ExecBatch(ctx, batch.String())
 }
 
 // RemoveUserAccountLimits resets MariaDB per-user limits back to unlimited (0) when a user is disabled or uninstalled.
@@ -163,23 +245,33 @@ func (g *Governor) RemoveUserAccountLimits(ctx context.Context, daUsername strin
 	if err := config.ValidateIdentifier(daUsername); err != nil {
 		return err
 	}
+	if isProtectedDBUser(daUsername) {
+		return nil
+	}
 	return g.alterAllDBUsersForSystemUser(ctx, daUsername, 0, 0)
 }
 
-// ApplySingleDBUserLimits immediately enforces Tier-2 limits on a newly created MariaDB user (database_user_create_post hook).
-func (g *Governor) ApplySingleDBUserLimits(ctx context.Context, dbUser string, limits config.ResourceLimits) error {
+// ApplySingleOwnedDBUserLimits verifies dbUser is not a system account and strictly belongs to daUsername
+// before applying Tier-2 MariaDB limits (S9).
+func (g *Governor) ApplySingleOwnedDBUserLimits(ctx context.Context, daUsername, dbUser string, limits config.ResourceLimits) error {
+	if err := config.ValidateIdentifier(daUsername); err != nil {
+		return err
+	}
 	dbUser = strings.TrimSpace(dbUser)
 	if dbUser == "" || strings.ContainsAny(dbUser, "';\"\\\r\n\t") {
 		return fmt.Errorf("invalid db username %q", dbUser)
 	}
-
-	maxConn := 0
-	maxTime := 0
-	if limits.Enabled {
-		maxConn = limits.MySQLMaxConnections
-		maxTime = limits.MySQLMaxStatementTime
+	if isProtectedDBUser(dbUser) || isProtectedDBUser(daUsername) {
+		return fmt.Errorf("refusing to modify protected MariaDB system account %q", dbUser)
+	}
+	if g.Registry != nil {
+		owner, matched := g.Registry.ResolveDBUser(dbUser)
+		if !matched || owner.Username != daUsername {
+			return fmt.Errorf("db user %q does not belong to DirectAdmin user %q", dbUser, daUsername)
+		}
 	}
 
+	maxConn, maxTime := g.effectiveMySQLCaps(daUsername, limits)
 	escapedUser := escapeSQLString(dbUser)
 	rows, err := g.Runner.QueryTSV(ctx, fmt.Sprintf(
 		"SELECT User, Host FROM mysql.user WHERE User = '%s';", escapedUser,
@@ -188,6 +280,27 @@ func (g *Governor) ApplySingleDBUserLimits(ctx context.Context, dbUser string, l
 		return err
 	}
 	return g.execAlterForUserHostRows(ctx, rows, maxConn, maxTime)
+}
+
+// ApplySingleDBUserLimits enforces Tier-2 limits on a single DB user after blocking protected accounts
+// and validating ownership against Registry if available (S9).
+func (g *Governor) ApplySingleDBUserLimits(ctx context.Context, dbUser string, limits config.ResourceLimits) error {
+	dbUser = strings.TrimSpace(dbUser)
+	if dbUser == "" || strings.ContainsAny(dbUser, "';\"\\\r\n\t") {
+		return fmt.Errorf("invalid db username %q", dbUser)
+	}
+	if isProtectedDBUser(dbUser) {
+		return fmt.Errorf("refusing to modify protected MariaDB system account %q", dbUser)
+	}
+	ownerName := dbUser
+	if g.Registry != nil {
+		owner, matched := g.Registry.ResolveDBUser(dbUser)
+		if !matched {
+			return fmt.Errorf("db user %q is not owned by any managed DirectAdmin hosting user", dbUser)
+		}
+		ownerName = owner.Username
+	}
+	return g.ApplySingleOwnedDBUserLimits(ctx, ownerName, dbUser, limits)
 }
 
 func (g *Governor) alterAllDBUsersForSystemUser(ctx context.Context, daUsername string, maxConn, maxTime int) error {
@@ -219,7 +332,7 @@ func (g *Governor) execAlterForUserHostRows(ctx context.Context, rows []string, 
 		}
 		u := strings.TrimSpace(parts[0])
 		h := strings.TrimSpace(parts[1])
-		if u == "" || h == "" {
+		if u == "" || h == "" || isProtectedDBUser(u) {
 			continue
 		}
 		fmt.Fprintf(&batch,
@@ -263,11 +376,7 @@ func (g *Governor) UnblockUser(ctx context.Context, daUsername string) error {
 	return g.ApplyUserAccountLimits(ctx, daUsername, limits)
 }
 
-// PollOnce executes one cycle of the Tier-3 MariaDB Watchdog:
-//  1. Restores any expired Penalty Box entries.
-//  2. Queries information_schema.PROCESSLIST.
-//  3. Aggregates connections, active threads, and MEMORY_USED per DirectAdmin system user.
-//  4. Kills heaviest offending queries and triggers Penalty Box if repeated violations exceed threshold.
+// PollOnce executes one cycle of the Tier-3 MariaDB Watchdog.
 func (g *Governor) PollOnce(ctx context.Context) (killedCount int, err error) {
 	now := g.NowFunc()
 	g.expirePenalties(ctx, now)
@@ -471,8 +580,29 @@ func (g *Governor) recordViolationAndMaybePenalize(ctx context.Context, now time
 		return
 	}
 
+	threshold := limits.MySQLPenaltyThreshold
+	if threshold < 1 {
+		threshold = 5
+	}
+	windowSec := limits.MySQLPenaltyWindowSec
+	if windowSec < 5 {
+		windowSec = 60
+	}
+	durationSec := limits.MySQLPenaltyDurationSec
+	if durationSec < 10 {
+		durationSec = 300
+	}
+	penConn := limits.MySQLPenaltyConn
+	if penConn < 1 {
+		penConn = 1
+	}
+	penTime := limits.MySQLPenaltyTimeSec
+	if penTime < 1 {
+		penTime = 1
+	}
+
 	nowUnix := now.Unix()
-	cutoff := nowUnix - int64(limits.MySQLPenaltyWindowSec)
+	cutoff := nowUnix - int64(windowSec)
 
 	g.mu.Lock()
 	if existing, ok := g.penalties[acct.Username]; ok && nowUnix < existing.ExpiresUnix {
@@ -490,7 +620,7 @@ func (g *Governor) recordViolationAndMaybePenalize(ctx context.Context, now time
 	pruned = append(pruned, nowUnix)
 	g.violationTimestamps[acct.Username] = pruned
 
-	if len(pruned) < limits.MySQLPenaltyThreshold {
+	if len(pruned) < threshold {
 		g.mu.Unlock()
 		return
 	}
@@ -498,24 +628,24 @@ func (g *Governor) recordViolationAndMaybePenalize(ctx context.Context, now time
 	entry := PenaltyEntry{
 		Username:    acct.Username,
 		StartedUnix: nowUnix,
-		ExpiresUnix: nowUnix + int64(limits.MySQLPenaltyDurationSec),
-		Reason:      fmt.Sprintf("%d killed queries within %ds", len(pruned), limits.MySQLPenaltyWindowSec),
+		ExpiresUnix: nowUnix + int64(durationSec),
+		Reason:      fmt.Sprintf("%d killed queries within %ds", len(pruned), windowSec),
 	}
 	g.penalties[acct.Username] = entry
 	delete(g.violationTimestamps, acct.Username)
 	_ = g.savePenaltyStateLocked()
 	g.mu.Unlock()
 
-	_ = g.alterAllDBUsersForSystemUser(ctx, acct.Username, limits.MySQLPenaltyConn, limits.MySQLPenaltyTimeSec)
+	_ = g.alterAllDBUsersForSystemUser(ctx, acct.Username, penConn, penTime)
 
 	if g.Logger != nil {
 		_ = g.Logger.Log(ipc.ViolationEntry{
 			TimestampUnix: nowUnix,
 			Username:      acct.Username,
 			Type:          logger.TypeMySQLPenaltyBox,
-			DurationMS:    int64(limits.MySQLPenaltyDurationSec) * 1000,
+			DurationMS:    int64(durationSec) * 1000,
 			Detail: fmt.Sprintf("Throttled for %ds (MAX_USER_CONNECTIONS=%d, MAX_STATEMENT_TIME=%ds): %s",
-				limits.MySQLPenaltyDurationSec, limits.MySQLPenaltyConn, limits.MySQLPenaltyTimeSec, entry.Reason),
+				durationSec, penConn, penTime, entry.Reason),
 		})
 	}
 }
@@ -583,14 +713,37 @@ func (g *Governor) savePenaltyStateLocked() error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(g.PenaltyStatePath), 0o750); err != nil {
+	dir := filepath.Dir(g.PenaltyStatePath)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return err
 	}
-	tmp := g.PenaltyStatePath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	tmp, err := os.CreateTemp(dir, ".penalty-*.json")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, g.PenaltyStatePath)
+	tmpName := tmp.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, g.PenaltyStatePath); err != nil {
+		return err
+	}
+	cleanupTmp = false
+	return nil
 }
 
 func parseProcessRow(line string) (processRow, bool) {
@@ -598,37 +751,35 @@ func parseProcessRow(line string) (processRow, bool) {
 	if len(parts) < 6 {
 		return processRow{}, false
 	}
+
 	id, err := strconv.ParseUint(strings.TrimSpace(parts[0]), 10, 64)
 	if err != nil {
 		return processRow{}, false
 	}
 	timeMS, _ := strconv.ParseInt(strings.TrimSpace(parts[3]), 10, 64)
 	memBytes, _ := strconv.ParseUint(strings.TrimSpace(parts[4]), 10, 64)
-	info := strings.TrimSpace(parts[5])
-	if info == "NULL" {
-		info = ""
-	}
+
 	return processRow{
 		ID:          id,
 		DBUser:      strings.TrimSpace(parts[1]),
 		Command:     strings.TrimSpace(parts[2]),
 		TimeMS:      timeMS,
 		MemoryBytes: memBytes,
-		Info:        info,
+		Info:        strings.TrimSpace(parts[5]),
 	}, true
 }
 
 func isActiveQueryCommand(cmd string) bool {
 	switch cmd {
-	case "", "Sleep", "Daemon", "Binlog Dump", "Binlog Dump GTID":
-		return false
-	default:
+	case "Query", "Execute":
 		return true
+	default:
+		return false
 	}
 }
 
 func filterUnkilled(rows []processRow, killed map[uint64]bool) []processRow {
-	out := make([]processRow, 0, len(rows))
+	var out []processRow
 	for _, r := range rows {
 		if !killed[r.ID] {
 			out = append(out, r)
@@ -646,20 +797,23 @@ func formatQueryDetail(q processRow, reason string) string {
 	if sqlSnippet == "" {
 		sqlSnippet = "(" + q.Command + ")"
 	}
-	return fmt.Sprintf("[PID %d | DBUser %s | %.1fMB | %dms | %s] %s",
-		q.ID, q.DBUser, bytesToMB(q.MemoryBytes), q.TimeMS, reason, sqlSnippet)
+	if len(sqlSnippet) > 300 {
+		sqlSnippet = sqlSnippet[:300] + "..."
+	}
+	return fmt.Sprintf("[%s] db_user=%s thread=%d mem=%.1fMB time=%dms | SQL: %s",
+		reason, q.DBUser, q.ID, bytesToMB(q.MemoryBytes), q.TimeMS, sqlSnippet)
 }
 
 func escapeSQLString(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `'`, `\'`)
+	s = strings.ReplaceAll(s, `'`, `''`)
 	return s
 }
 
 func escapeSQLLikeBang(s string) string {
 	s = escapeSQLString(s)
-	s = strings.ReplaceAll(s, "!", "!!")
-	s = strings.ReplaceAll(s, "%", "!%")
-	s = strings.ReplaceAll(s, "_", "!_")
+	s = strings.ReplaceAll(s, `!`, `!!`)
+	s = strings.ReplaceAll(s, `%`, `!%`)
+	s = strings.ReplaceAll(s, `_`, `!_`)
 	return s
 }

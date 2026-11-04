@@ -6,10 +6,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -137,6 +140,11 @@ func main() {
 			log.Fatalf("check-update failed: %v", err)
 		}
 
+	case "config-updater":
+		if err := runConfigUpdater(os.Args[2:]); err != nil {
+			log.Fatalf("config-updater failed: %v", err)
+		}
+
 	case "update":
 		if err := runUpdate(os.Args[2:]); err != nil {
 			log.Fatalf("update failed: %v", err)
@@ -145,6 +153,21 @@ func main() {
 	case "rollback":
 		if err := runRollback(); err != nil {
 			log.Fatalf("rollback failed: %v", err)
+		}
+
+	case "keygen":
+		if err := runKeygen(); err != nil {
+			log.Fatalf("keygen failed: %v", err)
+		}
+
+	case "sign":
+		if err := runSign(os.Args[2:]); err != nil {
+			log.Fatalf("sign failed: %v", err)
+		}
+
+	case "verify":
+		if err := runVerify(os.Args[2:]); err != nil {
+			log.Fatalf("verify failed: %v", err)
 		}
 
 	case "help", "-h", "--help":
@@ -170,8 +193,12 @@ func printUsage() {
 	fmt.Println("  da-resourced stats [username] [--json]       Display live Cgroups v2 & MariaDB usage metrics")
 	fmt.Println("  da-resourced audit-mycnf [/etc/my.cnf]       Audit MariaDB Tier-1 per-thread memory settings")
 	fmt.Println("  da-resourced check-update                    Check GitHub Releases for newer version")
-	fmt.Println("  da-resourced update [--version vX.Y.Z]       Download, verify SHA-256 & atomically update from GitHub")
+	fmt.Println("  da-resourced config-updater [flags]          Update /etc/da-resourced/updater.conf as root")
+	fmt.Println("  da-resourced update [--version vX.Y.Z]       Download, verify Ed25519 + SHA-256 & atomically update")
 	fmt.Println("  da-resourced rollback                        Restore previous snapshot from /var/backups/da-resource-limiter")
+	fmt.Println("  da-resourced verify <file> [sigfile]         Verify Ed25519 detached signature against embedded public key")
+	fmt.Println("  da-resourced sign <file> [--out sigfile]     Sign file using RELEASE_SIGNING_PRIVATE_KEY env var")
+	fmt.Println("  da-resourced keygen                          Generate a new Ed25519 release-signing keypair")
 	fmt.Println("  da-resourced version                         Print build version information")
 }
 
@@ -223,13 +250,17 @@ func runServe(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := eng.MySQLGov.DetectCapabilities(ctx); err != nil {
+	detectCtx, detectCancel := context.WithTimeout(ctx, 10*time.Second)
+	if err := eng.MySQLGov.DetectCapabilities(detectCtx); err != nil {
 		log.Printf("warning: MariaDB MEMORY_USED probe failed (falling back to thread/time watchdog): %v", err)
 	}
+	detectCancel()
 
-	if err := eng.ApplyAll(ctx); err != nil {
+	initCtx, initCancel := context.WithTimeout(ctx, 2*time.Minute)
+	if err := eng.ApplyAll(initCtx); err != nil {
 		log.Printf("warning: initial user limits sync: %v", err)
 	}
+	initCancel()
 	eng.CheckOOMEvents()
 
 	ipcServer := ipc.NewServer(*adminSock, *userSock, eng)
@@ -240,53 +271,103 @@ func runServe(args []string) error {
 	log.Printf("started %s | users=%d | fpm=%s | mysql=%s | sock=%s",
 		version.Info(), eng.Registry.Count(), *fpmInterval, *mysqlInterval, *adminSock)
 
-	fpmTicker := time.NewTicker(*fpmInterval)
-	defer fpmTicker.Stop()
-
-	mysqlTicker := time.NewTicker(*mysqlInterval)
-	defer mysqlTicker.Stop()
-
-	oomTicker := time.NewTicker(*oomInterval)
-	defer oomTicker.Stop()
-
-	reloadTicker := time.NewTicker(*reloadInterval)
-	defer reloadTicker.Stop()
-
 	sighupCh := make(chan os.Signal, 1)
 	signal.Notify(sighupCh, syscall.SIGHUP)
 	defer signal.Stop(sighupCh)
 
-	for {
-		select {
-		case <-ctx.Done():
-			log.Printf("shutting down gracefully...")
-			ipcServer.Wait()
-			return nil
+	var wg sync.WaitGroup
 
-		case <-sighupCh:
-			log.Printf("received SIGHUP: reloading DirectAdmin user registry & limits")
-			_ = eng.Registry.Reload()
-			_ = eng.ApplyAll(ctx)
-
-		case <-reloadTicker.C:
-			if err := eng.Registry.Reload(); err != nil {
-				log.Printf("periodic registry reload error: %v", err)
+	// 1. Independent PHP-FPM / OpenLiteSpeed PID Classifier goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(*fpmInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				scanCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				if _, err := eng.Classifier.ScanOnce(scanCtx, 0); err != nil && ctx.Err() == nil {
+					log.Printf("PHP-FPM classifier scan error: %v", err)
+				}
+				cancel()
 			}
-
-		case <-fpmTicker.C:
-			if _, err := eng.Classifier.ScanOnce(ctx, 0); err != nil {
-				log.Printf("PHP-FPM classifier scan error: %v", err)
-			}
-
-		case <-mysqlTicker.C:
-			if _, err := eng.MySQLGov.PollOnce(ctx); err != nil {
-				log.Printf("MariaDB watchdog poll error: %v", err)
-			}
-
-		case <-oomTicker.C:
-			eng.CheckOOMEvents()
 		}
-	}
+	}()
+
+	// 2. Independent MariaDB PROCESSLIST Watchdog goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(*mysqlInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				pollCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				if _, err := eng.MySQLGov.PollOnce(pollCtx); err != nil && ctx.Err() == nil {
+					log.Printf("MariaDB watchdog poll error: %v", err)
+				}
+				cancel()
+			}
+		}
+	}()
+
+	// 3. Independent Cgroups v2 OOM Event Monitor goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(*oomInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				eng.CheckOOMEvents()
+			}
+		}
+	}()
+
+	// 4. Independent DirectAdmin Registry Reload, Orphan Slice Pruner & SIGHUP Sync goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(*reloadInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-sighupCh:
+				log.Printf("received SIGHUP: reloading DirectAdmin user registry & limits")
+				_ = eng.Registry.Reload()
+				syncCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+				if err := eng.ApplyAll(syncCtx); err != nil && ctx.Err() == nil {
+					log.Printf("SIGHUP ApplyAll error: %v", err)
+				}
+				cancel()
+			case <-ticker.C:
+				if err := eng.Registry.Reload(); err != nil {
+					log.Printf("periodic registry reload error: %v", err)
+					continue
+				}
+				pruneCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+				eng.PruneOrphans(pruneCtx)
+				cancel()
+			}
+		}
+	}()
+
+	<-ctx.Done()
+	log.Printf("shutting down gracefully...")
+	ipcServer.Wait()
+	wg.Wait()
+	return nil
 }
 
 func runApplyUser(args []string) error {
@@ -516,9 +597,47 @@ func runCheckUpdate() error {
 	return nil
 }
 
+func runConfigUpdater(args []string) error {
+	fs := flag.NewFlagSet("config-updater", flag.ContinueOnError)
+	channel := fs.String("channel", "", "Release channel: stable or beta")
+	retention := fs.Int("retention", 0, "Backup snapshot retention (1..30)")
+	tokenStdin := fs.Bool("token-stdin", false, "Read GitHub Personal Access Token safely from stdin")
+	clearToken := fs.Bool("clear-token", false, "Remove stored GitHub token")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	eng, _ := buildEngine()
+	cfg, err := eng.Store.LoadUpdaterConfig()
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if *channel != "" {
+		cfg.UpdateChannel = *channel
+	}
+	if *retention > 0 {
+		cfg.BackupRetention = *retention
+	}
+	if *clearToken {
+		cfg.GitHubToken = ""
+	} else if *tokenStdin {
+		raw, err := io.ReadAll(io.LimitReader(os.Stdin, 4096))
+		if err != nil {
+			return err
+		}
+		cfg.GitHubToken = strings.TrimSpace(string(raw))
+	}
+	if err := eng.Store.SaveUpdaterConfig(cfg); err != nil {
+		return err
+	}
+	log.Printf("saved updater configuration at %s (repo=%s, channel=%s, retention=%d)",
+		eng.Store.UpdaterCfgPath, cfg.GitHubRepo, cfg.UpdateChannel, cfg.BackupRetention)
+	return nil
+}
+
 func runUpdate(args []string) error {
 	fs := flag.NewFlagSet("update", flag.ContinueOnError)
-	targetVer := fs.String("version", "", "Optional specific release tag (e.g. v1.2.0); defaults to latest")
+	targetVer := fs.String("version", "", "Optional specific release tag (e.g. v1.0.4.1); defaults to latest")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -529,6 +648,91 @@ func runUpdate(args []string) error {
 func runRollback() error {
 	_, upd := buildEngine()
 	return upd.RunCLIRollback(context.Background())
+}
+
+func runKeygen() error {
+	pub, priv, err := updater.GenerateKeypairHex()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("PUBLIC_KEY_HEX=%s\n", pub)
+	fmt.Printf("PRIVATE_KEY_HEX=%s\n", priv)
+	return nil
+}
+
+func runSign(args []string) error {
+	fs := flag.NewFlagSet("sign", flag.ContinueOnError)
+	outPath := fs.String("out", "", "Detached signature output file (default: <file>.sig)")
+	keyFile := fs.String("key-file", "", "Optional file containing hex-encoded Ed25519 private key (0600)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 {
+		return errors.New("usage: da-resourced sign [--out sigfile] [--key-file path] <file>")
+	}
+	targetFile := fs.Arg(0)
+
+	privHex := strings.TrimSpace(os.Getenv("RELEASE_SIGNING_PRIVATE_KEY"))
+	if *keyFile != "" {
+		rawKey, err := os.ReadFile(*keyFile)
+		if err != nil {
+			return err
+		}
+		privHex = strings.TrimSpace(string(rawKey))
+	}
+	if privHex == "" {
+		return errors.New("RELEASE_SIGNING_PRIVATE_KEY env var or --key-file is required")
+	}
+
+	data, err := os.ReadFile(targetFile)
+	if err != nil {
+		return err
+	}
+	sigHex, err := updater.SignDataHex(privHex, data)
+	if err != nil {
+		return err
+	}
+
+	dest := *outPath
+	if dest == "" {
+		dest = targetFile + ".sig"
+	}
+	content := fmt.Sprintf("%s  %s\n", sigHex, filepath.Base(targetFile))
+	if dest == "-" {
+		_, err = os.Stdout.WriteString(content)
+		return err
+	}
+	return os.WriteFile(dest, []byte(content), 0o644)
+}
+
+func runVerify(args []string) error {
+	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
+	pubHex := fs.String("pubkey", version.DefaultReleasePublicKeyHex, "Hex-encoded Ed25519 release public key")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 {
+		return errors.New("usage: da-resourced verify [--pubkey hex] <file> [sigfile]")
+	}
+	targetFile := fs.Arg(0)
+	sigFile := targetFile + ".sig"
+	if fs.NArg() >= 2 {
+		sigFile = fs.Arg(1)
+	}
+
+	data, err := os.ReadFile(targetFile)
+	if err != nil {
+		return err
+	}
+	sigBytes, err := os.ReadFile(sigFile)
+	if err != nil {
+		return err
+	}
+	if err := updater.VerifyDataHex(*pubHex, data, string(sigBytes)); err != nil {
+		return err
+	}
+	fmt.Printf("OK: Ed25519 signature verified for %s\n", filepath.Base(targetFile))
+	return nil
 }
 
 func getenvOr(key, fallback string) string {

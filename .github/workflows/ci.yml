@@ -15,12 +15,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Setup Go 1.22
-        uses: actions/setup-go@v5
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: '1.22'
+          go-version: 'stable'
           cache: false
 
       - name: Check LF line endings on scripts and configs
@@ -30,8 +30,29 @@ jobs:
             exit 1
           fi
 
-      - name: Run go vet
-        run: go vet ./...
+      - name: Verify single-source version consistency (plugin.conf == version.go)
+        run: |
+          PLUGIN_VER="v$(awk -F= '/^version=/{print $2}' plugin/plugin.conf | tr -d '[:space:]')"
+          GO_VER="$(sed -n 's/.*Version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' internal/version/version.go | head -n 1)"
+          if [[ -z "$PLUGIN_VER" || "$PLUGIN_VER" != "$GO_VER" ]]; then
+            echo "Error: version mismatch between plugin/plugin.conf ($PLUGIN_VER) and internal/version/version.go ($GO_VER)"
+            exit 1
+          fi
+          echo "Verified version sync: $GO_VER"
+
+      - name: Verify gofmt formatting
+        run: |
+          UNFORMATTED="$(gofmt -l .)"
+          if [[ -n "$UNFORMATTED" ]]; then
+            echo "Error: the following Go files are not formatted with gofmt:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+
+      - name: Run go vet & staticcheck
+        run: |
+          go vet ./...
+          go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
 
       - name: Run unit tests with race detector
         run: go test -v -race ./...
@@ -49,7 +70,7 @@ jobs:
           shopt -s globstar nullglob
           shellcheck scripts/**/*.sh plugin/admin/api.raw plugin/user/stats.raw plugin/admin/index.html plugin/user/index.html
 
-      - name: Lint PHP endpoints
+      - name: Lint & test PHP endpoints
         run: |
           php -l plugin/admin/api.php
           php -l plugin/user/stats.php

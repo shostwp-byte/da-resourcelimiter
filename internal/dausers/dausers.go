@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,7 +17,9 @@ import (
 
 const (
 	MinValidUID uint32 = 1000
-	MaxValidUID uint32 = 59999 // Blocks system accounts such as nobody/nfsnobody (65534)
+	// MaxValidUID defaults to 65533 so high-UID hosting accounts (60000..65533) work out of the box
+	// while still strictly blocking system overflow accounts such as nobody/nfsnobody (65534).
+	MaxValidUID uint32 = 65533
 )
 
 // Account represents a DirectAdmin hosting user mapped to its Linux UID.
@@ -32,11 +35,14 @@ type Account struct {
 type Registry struct {
 	daUsersDir string
 	passwdPath string
+	MinUID     uint32
+	MaxUID     uint32
 
-	mu              sync.RWMutex
-	byName          map[string]Account
-	byUID           map[uint32]Account
-	sortedNamesDesc []string
+	mu               sync.RWMutex
+	byName           map[string]Account
+	byUID            map[uint32]Account
+	sortedNamesDesc  []string
+	lastSkipLogState string
 }
 
 func NewRegistry(daUsersDir, passwdPath string) *Registry {
@@ -46,12 +52,44 @@ func NewRegistry(daUsersDir, passwdPath string) *Registry {
 	if passwdPath == "" {
 		passwdPath = "/etc/passwd"
 	}
+	minUID := MinValidUID
+	maxUID := MaxValidUID
+	if rawMin := strings.TrimSpace(os.Getenv("DA_LIMITER_MIN_UID")); rawMin != "" {
+		if v, err := strconv.ParseUint(rawMin, 10, 32); err == nil && v >= 100 {
+			minUID = uint32(v)
+		}
+	}
+	if rawMax := strings.TrimSpace(os.Getenv("DA_LIMITER_MAX_UID")); rawMax != "" {
+		if v, err := strconv.ParseUint(rawMax, 10, 32); err == nil && uint32(v) >= minUID && v != 65534 {
+			maxUID = uint32(v)
+		}
+	}
 	return &Registry{
 		daUsersDir: daUsersDir,
 		passwdPath: passwdPath,
+		MinUID:     minUID,
+		MaxUID:     maxUID,
 		byName:     make(map[string]Account),
 		byUID:      make(map[uint32]Account),
 	}
+}
+
+func (r *Registry) effectiveBounds() (uint32, uint32) {
+	minU := r.MinUID
+	if minU == 0 {
+		minU = MinValidUID
+	}
+	maxU := r.MaxUID
+	if maxU == 0 {
+		maxU = MaxValidUID
+	}
+	return minU, maxU
+}
+
+// ValidUID reports whether uid falls within the configured customer UID range and is not nobody (65534).
+func (r *Registry) ValidUID(uid uint32) bool {
+	minU, maxU := r.effectiveBounds()
+	return uid >= minU && uid <= maxU && uid != 65534
 }
 
 type passwdEntry struct {
@@ -79,9 +117,12 @@ func (r *Registry) Reload() error {
 		return fmt.Errorf("read DirectAdmin users dir %s: %w", r.daUsersDir, err)
 	}
 
+	minU, maxU := r.effectiveBounds()
 	nextByName := make(map[string]Account, len(entries))
 	nextByUID := make(map[uint32]Account, len(entries))
 	var names []string
+	skippedAdmin := 0
+	skippedUIDRange := 0
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -96,7 +137,8 @@ func (r *Registry) Reload() error {
 		if !exists {
 			continue
 		}
-		if pw.uid < MinValidUID || pw.uid > MaxValidUID {
+		if pw.uid < minU || pw.uid > maxU || pw.uid == 65534 {
+			skippedUIDRange++
 			continue
 		}
 
@@ -112,6 +154,7 @@ func (r *Registry) Reload() error {
 		}
 		// Skip panel administrator accounts by default so sysadmin SSH/panel tasks are not throttled
 		if userType == "admin" || username == "admin" {
+			skippedAdmin++
 			continue
 		}
 
@@ -135,11 +178,20 @@ func (r *Registry) Reload() error {
 		return names[i] < names[j]
 	})
 
+	skipSummary := fmt.Sprintf("admin=%d,uid_range=%d(%d..%d)", skippedAdmin, skippedUIDRange, minU, maxU)
+
 	r.mu.Lock()
 	r.byName = nextByName
 	r.byUID = nextByUID
 	r.sortedNamesDesc = names
+	changedSkip := r.lastSkipLogState != skipSummary
+	r.lastSkipLogState = skipSummary
 	r.mu.Unlock()
+
+	if changedSkip && (skippedAdmin > 0 || skippedUIDRange > 0) {
+		log.Printf("registry loaded %d hosting users (exempted %d admin accounts, skipped %d accounts outside UID range %d..%d)",
+			len(nextByName), skippedAdmin, skippedUIDRange, minU, maxU)
+	}
 	return nil
 }
 
@@ -151,7 +203,7 @@ func (r *Registry) LookupByName(username string) (Account, bool) {
 }
 
 func (r *Registry) LookupByUID(uid uint32) (Account, bool) {
-	if uid < MinValidUID || uid > MaxValidUID {
+	if !r.ValidUID(uid) {
 		return Account{}, false
 	}
 	r.mu.RLock()
@@ -170,6 +222,17 @@ func (r *Registry) All() []Account {
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].Username < out[j].Username
 	})
+	return out
+}
+
+// ActiveUIDSet returns a snapshot set of all currently managed customer UIDs.
+func (r *Registry) ActiveUIDSet() map[uint32]struct{} {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[uint32]struct{}, len(r.byUID))
+	for uid := range r.byUID {
+		out[uid] = struct{}{}
+	}
 	return out
 }
 

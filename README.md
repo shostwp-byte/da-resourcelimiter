@@ -12,27 +12,42 @@
 
 ---
 
-**DA-ResourceLimiter** là giải pháp quản trị tài nguyên gốc (Native Linux Daemon + DirectAdmin Evolution Plugin) viết bằng **Golang thuần (`CGO_ENABLED=0`, không phụ thuộc thư viện ngoài)**, kết hợp **Linux Cgroups v2**, **PHP-FPM / OpenLiteSpeed LSPHP PID Classifier**, **MariaDB 3-Tier Governor** và **GitHub Releases Self-Updater**.
+**DA-ResourceLimiter** là giải pháp quản trị tài nguyên gốc (Native Linux Daemon + DirectAdmin Evolution Plugin) viết bằng **Golang thuần (`CGO_ENABLED=0`, không phụ thuộc thư viện ngoài)**, kết hợp **Linux Cgroups v2**, **PHP-FPM / OpenLiteSpeed LSPHP PID Classifier**, **MariaDB 3-Tier Governor** và **GitHub Releases Self-Updater xác thực chữ ký số Ed25519 + SHA-256**.
 
 ## Yêu cầu Hệ thống
 
 - **Hệ điều hành:** Debian 12, Ubuntu 22.04 / 24.04, AlmaLinux 8 / 9, Rocky Linux 8 / 9 (`x86_64` / `amd64` & `arm64`) đã bật **Cgroups v2 Unified Hierarchy** (`/sys/fs/cgroup/cgroup.controllers`).
-- **Control Panel:** DirectAdmin (tương thích đầy đủ **Evolution Skin** ở cả chế độ *Icons Grid* & *Sidebar*, hỗ trợ đa tài khoản Admin trong `admin.list`).
+- **Control Panel:** DirectAdmin (tương thích đầy đủ **Evolution Skin** widescreen ở cả chế độ *Icons Grid* & *Sidebar*, hỗ trợ đa tài khoản Admin trong `admin.list`).
 - **Cơ sở dữ liệu:** MariaDB 10.5+ (hỗ trợ cột `MEMORY_USED` trong `information_schema.PROCESSLIST`).
 
 ---
 
-## Cài đặt Nhanh 1-Click (DirectAdmin Production)
+## Cài đặt Xác thực theo Tag Phát hành (`v1.0.4.1`)
 
-Chạy dưới quyền `root` trên máy chủ DirectAdmin:
+Chạy dưới quyền `root` trên máy chủ DirectAdmin. Để đảm bảo an toàn chuỗi cung ứng (tránh thực thi trực tiếp script chưa kiểm chứng từ nhánh `main` và không làm lộ `GITHUB_TOKEN` trong `/proc/<pid>/cmdline`), hãy tải gói phát hành đã ghim tag và kiểm tra `SHA-256` trước khi cài đặt:
 
 ```bash
-# 1. Cài đặt từ Public GitHub Repository:
-curl -fsSL https://raw.githubusercontent.com/shostwp-byte/da-resourcelimiter/main/scripts/install.sh | bash
+# 1. Cài đặt từ Public GitHub Release (ghim tag v1.0.4.1 & kiểm tra SHA-256):
+VER="v1.0.4.1"
+ARCH="$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
+TMP_DIR="$(mktemp -d /tmp/da-limiter.XXXXXX)" && chmod 0700 "$TMP_DIR"
+curl -fsSL "https://github.com/shostwp-byte/da-resourcelimiter/releases/download/${VER}/checksums.txt" -o "${TMP_DIR}/checksums.txt"
+curl -fsSL "https://github.com/shostwp-byte/da-resourcelimiter/releases/download/${VER}/da-resource-limiter-linux-${ARCH}.tar.gz" -o "${TMP_DIR}/da-resource-limiter-linux-${ARCH}.tar.gz"
+(cd "$TMP_DIR" && grep " da-resource-limiter-linux-${ARCH}\.tar\.gz$" checksums.txt | sha256sum -c -)
+tar -xzf "${TMP_DIR}/da-resource-limiter-linux-${ARCH}.tar.gz" -C "$TMP_DIR"
+"${TMP_DIR}/da-resource-limiter/scripts/install.sh"
+rm -rf "$TMP_DIR"
+```
 
-# 2. Cài đặt từ Private GitHub Repository (với Read-only Fine-Grained Token):
+```bash
+# 2. Cài đặt từ Private GitHub Repository (truyền GITHUB_TOKEN qua stdin `curl -K -`, không lộ trên `ps`):
 export GITHUB_TOKEN="github_pat_XXXXXXXXXXXXXXXXXXXX"
-bash -c "$(curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" https://raw.githubusercontent.com/shostwp-byte/da-resourcelimiter/main/scripts/install.sh)"
+export TARGET_VERSION="v1.0.4.1"
+TMP_INST="$(mktemp /tmp/da-install.XXXXXX.sh)" && chmod 0700 "$TMP_INST"
+printf 'header = "Authorization: Bearer %s"\n' "$GITHUB_TOKEN" | \
+  curl -fsSL -K - "https://raw.githubusercontent.com/shostwp-byte/da-resourcelimiter/${TARGET_VERSION}/scripts/install.sh" -o "$TMP_INST"
+"$TMP_INST"
+rm -f "$TMP_INST"
 ```
 
 Sau khi cài đặt hoàn tất:
@@ -41,7 +56,7 @@ Sau khi cài đặt hoàn tất:
   2. *Package Limits* (cấu hình mặc định `default.conf` và giới hạn theo từng gói Hosting Package).
   3. *User Overrides* (cấp giới hạn riêng cho tài khoản VIP/Custom, được bảo vệ không bị ghi đè khi đồng bộ Package).
   4. *Violation & OOM Logs* (nhật ký Kernel OOM Kill, truy vấn SQL ngốn RAM/chậm bị ngắt và lịch sử Penalty Box).
-  5. *System & GitHub Update* (cấu hình Public/Private Token, kiểm tra bản mới, cập nhật 1-Click & khôi phục Snapshot).
+  5. *System & GitHub Update* (kiểm tra phiên bản mới, hiển thị trạng thái ghim repo & chữ ký số Ed25519).
 - **Giao diện Khách hàng (User Level):** `/CMD_PLUGINS/da_resource_limiter` — hiển thị trực quan mức sử dụng CPU / RAM / Processes / MySQL thực tế và Top 5 truy vấn SQL bị ngắt để khách hàng chủ động tối ưu mã nguồn.
 
 ---
@@ -49,21 +64,21 @@ Sau khi cài đặt hoàn tất:
 ## Kiến trúc Bảo vệ Đa tầng
 
 1. **Cô lập Cứng CPU, RAM & Chống Fork Bomb (Linux Cgroups v2):**
-   - Quản lý tự động `/etc/systemd/system/user-<UID>.slice.d/50-da-limits.conf` (`CPUQuota`, `CPUWeight`, `MemoryHigh`, `MemoryMax`, `MemorySwapMax=0M`, `IOWeight`, `TasksMax`).
-   - Đọc sự kiện chạm ngưỡng bóp mềm và tràn bộ nhớ trực tiếp từ `memory.events` (`high`, `oom_kill`) với chi phí CPU gần bằng 0.
+   - Quản lý nguyên tử `/etc/systemd/system/user-<UID>.slice.d/50-da-limits.conf` (`CPUQuota`, `CPUWeight`, `MemoryHigh`, `MemoryMax`, `MemorySwapMax=0M`, `IOWeight`, `TasksMax`) và tự động dọn dẹp drop-in mồ côi khi tài khoản Hosting bị xoá.
+   - Đọc sự kiện chạm ngưỡng bóp mềm và tràn bộ nhớ trực tiếp từ `memory.events` (`high`, `oom_kill`) ở goroutine độc lập.
 2. **Đưa PHP-FPM & OpenLiteSpeed LSPHP vào Cgroup của User (`da-php.scope`):**
-   - Quét và di chuyển tức thời các worker `php-fpm` / `lsphp` của khách hàng từ `system.slice` sang `/sys/fs/cgroup/user.slice/user-<UID>.slice/da-php.scope` (tuân thủ *No Internal Process Constraint* của Cgroups v2).
-   - Chặn cứng việc gom nhầm tài khoản hệ thống (`root`, `diradmin`, `admin`, `nobody=65534`, dải hợp lệ `1000 <= UID <= 59999`).
-   - Đồng bộ biến `DA_PHP_MAX_CHILDREN` và `DA_PHP_MEM_LIMIT` vào `user.conf` nhưng luôn bảo toàn nghiêm ngặt quyền sở hữu `diradmin:diradmin` (`0600`) của DirectAdmin.
+   - Quét và di chuyển tức thời các worker `php-fpm` / `lsphp` sang `/sys/fs/cgroup/user.slice/user-<UID>.slice/da-php.scope` có mutex đồng bộ và kiểm tra chống tái sử dụng PID (`starttime` trong `/proc/<pid>/stat`).
+   - Chặn cứng việc gom nhầm tài khoản hệ thống (`root`, `diradmin`, `admin`, `nobody=65534`; dải mặc định `1000 <= UID <= 65533`, cấu hình được qua `DA_LIMITER_MIN_UID` / `DA_LIMITER_MAX_UID`).
+   - Đồng bộ biến `DA_PHP_MAX_CHILDREN` và `DA_PHP_MEM_LIMIT` vào `user.conf` với khoá file `flock` và bảo toàn quyền sở hữu `diradmin:diradmin` (`0600`).
 3. **MariaDB 3-Tier Governor & Penalty Box:**
    - **Lớp 1:** Kiểm toán bộ đệm per-thread `/etc/my.cnf` (`da-resourced audit-mycnf`).
-   - **Lớp 2:** Đồng bộ `ALTER USER ... WITH MAX_USER_CONNECTIONS ... MAX_STATEMENT_TIME ...` an toàn qua `--defaults-extra-file` (`0600`), không lộ thông tin xác thực trên `/proc`.
-   - **Lớp 3:** Watchdog `1.5s` đọc `MEMORY_USED` trên `information_schema.PROCESSLIST`, ánh xạ chủ sở hữu theo *Longest-Prefix Match* (hỗ trợ chính xác cả username chứa dấu `_`), tự động `KILL QUERY` vượt ngưỡng và đưa tài khoản vi phạm lặp lại vào **Penalty Box** (lưu bền vững qua lần khởi động lại).
-4. **Dual Unix Socket & Xác thực Nhân Linux `SO_PEERCRED`:**
-   - **Admin Socket (`/var/run/da-resourced.sock`):** Xác thực trực tiếp UID không thể giả mạo từ nhân Linux (`SO_PEERCRED`) đối chiếu với `root`, `diradmin` và danh sách quản trị viên DirectAdmin (`/usr/local/directadmin/data/admin/admin.list` / `usertype=admin`).
-   - **User Socket (`/var/run/da-resourced-user.sock`):** Chỉ cho phép truy vấn đọc và khoá chặt mỗi tài khoản Hosting chỉ xem được số liệu của chính UID tiến trình đang gọi.
-5. **Cập nhật Nguyên tử từ GitHub Releases (Public & Private Repo):**
-   - Xác thực mã băm `SHA-256`, tạo Snapshot Backup tại `/var/backups/da-resource-limiter/`, bảo toàn tuyệt đối thư mục dữ liệu `plugin/data/`, kiểm tra sức khoẻ Socket trong 10 giây và **Auto-Rollback** tức thì nếu bản cập nhật mới gặp sự cố.
+   - **Lớp 2:** Đồng bộ gộp lô (`Batch ALTER USER`) `MAX_USER_CONNECTIONS` và `MAX_STATEMENT_TIME` an toàn qua `--defaults-extra-file` (`0600`) kèm timeout truy vấn cứng `5s`.
+   - **Lớp 3:** Watchdog độc lập `1.5s` đọc `MEMORY_USED` trên `information_schema.PROCESSLIST`, ánh xạ chủ sở hữu theo *Longest-Prefix Match*, tự động `KILL QUERY` vượt ngưỡng và đưa tài khoản vi phạm lặp lại vào **Penalty Box** (validate đầy đủ ngưỡng phạt `>= 1`).
+4. **Dual Unix Socket, `SO_PEERCRED` Pre-Decode & Chống CSRF:**
+   - **Admin Socket (`/var/run/da-resourced.sock`):** Kiểm tra `SO_PEERCRED` ngay trước khi giải mã JSON, giới hạn kết nối đồng thời, kết hợp kiểm tra `Origin`/`Referer`/`Sec-Fetch-Site` và mã HMAC `csrf_token` trên `admin/api.php`.
+   - **User Socket (`/var/run/da-resourced-user.sock`):** Giới hạn kết nối + tần suất theo từng UID (Sliding-Window Rate Limit), đọc ngược file JSONL theo khối 32 KB chống ngốn RAM và khoá chặt mỗi tài khoản chỉ đọc được dữ liệu của chính UID đang gọi.
+5. **Cập nhật Nguyên tử Ký số Ed25519 từ GitHub Releases:**
+   - Ghim cứng repository cập nhật chính thức, bắt buộc xác thực chữ ký số **Ed25519** (`checksums.txt.sig`) + mã băm **SHA-256** trước khi giải nén, khoá quyền cập nhật cho `root`/`diradmin`, tạo Snapshot Backup tại `/var/backups/da-resource-limiter/`, bảo toàn `plugin/data/` và tự động **Rollback** nếu Daemon mới lỗi.
 
 ---
 
@@ -75,13 +90,15 @@ Sau khi cài đặt hoàn tất:
 | `da-resourced stats` | Bảng theo dõi nhanh CPU %, RAM, Processes, MySQL RAM/Conns và Penalty của toàn bộ User. |
 | `da-resourced stats <user> --json` | Xuất thông số thời gian thực chi tiết dạng JSON cho 1 tài khoản Hosting. |
 | `da-resourced apply <user>` | Áp dụng tức thời Cgroup Slice, PHP tokens và giới hạn MariaDB cho `<user>`. |
-| `da-resourced apply-all` | Đồng bộ lại giới hạn hàng loạt cho toàn bộ tài khoản Hosting trên máy chủ. |
+| `da-resourced apply-all` | Đồng bộ gộp lô giới hạn cho toàn bộ tài khoản Hosting và dọn slice mồ côi. |
 | `da-resourced apply-package <pkg>` | Đồng bộ mọi User thuộc gói `<pkg>` (tự động giữ nguyên các VIP user bật `CUSTOM_OVERRIDE=yes`). |
 | `da-resourced unblock <user>` | Gỡ trạng thái phạt MySQL Penalty Box ngay lập tức cho `<user>`. |
 | `da-resourced audit-mycnf` | Kiểm tra thông số bộ nhớ `/etc/my.cnf` theo khuyến nghị Lớp 1. |
 | `da-resourced check-update` | Kiểm tra phiên bản mới nhất trên GitHub Releases. |
-| `da-resourced update` | Tự động tải gói phát hành mới, xác thực SHA-256 và cập nhật nguyên tử kèm Auto-Rollback. |
+| `da-resourced config-updater` | Cấu hình kênh phát hành / `GITHUB_TOKEN` (`--token-stdin`) dưới quyền `root`. |
+| `da-resourced update` | Tải gói phát hành mới, xác thực chữ ký Ed25519 + SHA-256 và cập nhật nguyên tử kèm Auto-Rollback. |
 | `da-resourced rollback` | Khôi phục ngay lập tức về bản Snapshot Backup gần nhất. |
+| `da-resourced verify <file> [sig]` | Xác thực chữ ký số Ed25519 rời (`checksums.txt.sig`) bằng khoá công khai nhúng sẵn. |
 
 ### Gỡ cài đặt an toàn
 
@@ -99,39 +116,22 @@ Sau khi cài đặt hoàn tất:
 
 ```text
 DA-ResourceLimiter/
-├── cmd/da-resourced/       # Entrypoint CLI & Systemd Daemon
+├── cmd/da-resourced/       # Entrypoint CLI, Ed25519 Sign/Verify & Systemd Multi-Goroutine Daemon
 ├── internal/
-│   ├── cgroup/             # Quản lý Systemd user-<UID>.slice, da-php.scope & đọc Cgroup v2 stats
-│   ├── config/             # Lưu trữ phân cấp default.conf -> packages/*.conf -> users/*.conf
-│   ├── dausers/            # Đồng bộ tài khoản DirectAdmin (1000..59999) & Longest-Prefix DB mapping
-│   ├── engine/             # Điều phối trung tâm, xử lý IPC & xác thực Admin/User SO_PEERCRED
-│   ├── fpm/                # Quét /proc di chuyển PHP-FPM/lsphp & đồng bộ an toàn user.conf
-│   ├── ipc/                # Giao thức JSON & Dual Unix Domain Socket Server/Client
-│   ├── logger/             # Nhật ký vi phạm JSONL tự động xoay vòng (Rotation)
-│   ├── mysqlgov/           # MariaDB 3-Tier Governor, PROCESSLIST Watchdog & Penalty Box
-│   ├── updater/            # GitHub Releases Updater (Public/Private Repo, SHA-256, Tar-Slip Safe)
-│   └── version/            # Thông tin phiên bản nhúng lúc biên dịch
+│   ├── cgroup/             # Quản lý Systemd user-<UID>.slice, da-php.scope & dọn slice mồ côi
+│   ├── config/             # Lưu trữ phân cấp default/package/user, validate Penalty & ghim Repo
+│   ├── dausers/            # Đồng bộ tài khoản DirectAdmin (1000..65533) & Longest-Prefix DB mapping
+│   ├── engine/             # Điều phối trung tâm, Batch Sync nền & phân quyền root/diradmin/admin
+│   ├── fpm/                # Quét /proc di chuyển PHP-FPM/lsphp (Mutex + PID starttime) & flock user.conf
+│   ├── ipc/                # Dual Unix Domain Socket (Semaphore + Per-UID Rate Limit + Pre-Decode Auth)
+│   ├── logger/             # Nhật ký vi phạm JSONL xoay vòng & đọc ngược cuối file 32 KB
+│   ├── mysqlgov/           # MariaDB 3-Tier Governor (5s Timeout, Batch ALTER, Ownership Guard)
+│   ├── updater/            # GitHub Releases Updater (Ed25519 + SHA-256, Concurrency Lock, Tar-Slip Safe)
+│   └── version/            # Phiên bản, Repository ghim mặc định & Ed25519 Public Key nhúng sẵn
 ├── plugin/                 # Giao diện DirectAdmin Plugin (admin/, user/, hooks/, images/, templates/)
 ├── scripts/                # install.sh, update.sh, uninstall.sh, qa_verify.sh & da_hooks/
-├── systemd/                # Cấu hình dịch vụ da-resourced.service (OOMScoreAdjust=-900)
-└── docs/RUNBOOK.md         # Sổ tay triển khai, nghiệm thu & vận hành chi tiết
-```
-
----
-
-## Phát triển & Xuất bản Bản Phát hành Mới
-
-```bash
-# Chạy toàn bộ Unit Tests & kiểm tra Race Condition
-make test
-
-# Biên dịch tĩnh đa kiến trúc (CGO_ENABLED=0)
-make build-linux-amd64
-make build-linux-arm64
-
-# Đẩy tag phiên bản mới để GitHub Actions tự động đóng gói & xuất bản GitHub Release
-git tag -a vX.Y.Z -m "DA-ResourceLimiter vX.Y.Z"
-git push origin main --tags
+├── systemd/                # Cấu hình dịch vụ da-resourced.service đã bật Systemd Hardening
+└── docs/RUNBOOK.md         # Sổ tay triển khai, ký số phát hành, nghiệm thu & vận hành chi tiết
 ```
 
 ---

@@ -17,6 +17,7 @@ func TestRegistryReloadFiltersSystemUIDsAndResolvesDBUsers(t *testing.T) {
 		"admin:x:1000:1000:Admin:/home/admin:/bin/bash\n" +
 		"vina:x:1001:1001:Vina:/home/vina:/bin/bash\n" +
 		"vina_host:x:1002:1002:VinaHost:/home/vina_host:/bin/bash\n" +
+		"lveuser:x:60005:60005:LVEUser:/home/lveuser:/bin/bash\n" +
 		"nobody:x:65534:65534:Kernel Overflow User:/:/sbin/nologin\n"
 
 	if err := os.WriteFile(passwdFile, []byte(passwdContent), 0o644); err != nil {
@@ -36,6 +37,7 @@ func TestRegistryReloadFiltersSystemUIDsAndResolvesDBUsers(t *testing.T) {
 	writeDAUser("admin", "usertype=admin\npackage=admin\n")
 	writeDAUser("vina", "usertype=user\npackage=silver\n")
 	writeDAUser("vina_host", "usertype=user\npackage=gold\n")
+	writeDAUser("lveuser", "usertype=user\npackage=gold\n")
 	writeDAUser("nobody", "usertype=user\npackage=default\n")
 
 	reg := NewRegistry(daDir, passwdFile)
@@ -43,8 +45,11 @@ func TestRegistryReloadFiltersSystemUIDsAndResolvesDBUsers(t *testing.T) {
 		t.Fatalf("Reload: %v", err)
 	}
 
-	if reg.Count() != 2 {
-		t.Fatalf("expected 2 managed hosting accounts (vina, vina_host), got %d", reg.Count())
+	if reg.Count() != 3 {
+		t.Fatalf("expected 3 managed hosting accounts (vina, vina_host, lveuser), got %d", reg.Count())
+	}
+	if _, ok := reg.LookupByUID(60005); !ok {
+		t.Fatal("expected high UID 60005 (< 65534) to be managed (R11)")
 	}
 
 	if _, ok := reg.LookupByUID(65534); ok {
