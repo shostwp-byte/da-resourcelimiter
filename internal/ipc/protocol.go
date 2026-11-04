@@ -1,6 +1,12 @@
 package ipc
 
-import "github.com/shostwp-byte/da-resourcelimiter/internal/config"
+import (
+	"encoding/json"
+	"strconv"
+	"strings"
+
+	"github.com/shostwp-byte/da-resourcelimiter/internal/config"
+)
 
 // Supported IPC Socket actions over /var/run/da-resourced.sock (Admin) and /var/run/da-resourced-user.sock (User).
 const (
@@ -49,6 +55,49 @@ type Request struct {
 	KeepStoredToken bool   `json:"keep_stored_token,omitempty"`
 	UpdateChannel   string `json:"update_channel,omitempty"`
 	BackupRetention int    `json:"backup_retention,omitempty"`
+}
+
+// UnmarshalJSON decodes Request and gracefully coerces string-encoded CGI query parameters
+// (such as "limit": "100" or "sync_users": "true") into strongly typed Go fields.
+func (r *Request) UnmarshalJSON(data []byte) error {
+	type rawRequest Request
+	var fast rawRequest
+	if err := json.Unmarshal(data, &fast); err == nil {
+		*r = Request(fast)
+		return nil
+	}
+
+	var m map[string]interface{}
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
+	for _, intKey := range []string{"limit", "backup_retention"} {
+		if s, ok := m[intKey].(string); ok {
+			trimmed := strings.TrimSpace(s)
+			if trimmed == "" {
+				delete(m, intKey)
+			} else if v, err := strconv.Atoi(trimmed); err == nil {
+				m[intKey] = v
+			}
+		}
+	}
+	for _, boolKey := range []string{"sync_users", "keep_stored_token"} {
+		if s, ok := m[boolKey].(string); ok {
+			v := strings.ToLower(strings.TrimSpace(s))
+			m[boolKey] = (v == "1" || v == "true" || v == "yes" || v == "on")
+		}
+	}
+
+	normalized, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	var coerced rawRequest
+	if err := json.Unmarshal(normalized, &coerced); err != nil {
+		return err
+	}
+	*r = Request(coerced)
+	return nil
 }
 
 // Response is the standard JSON reply returned by da-resourced.

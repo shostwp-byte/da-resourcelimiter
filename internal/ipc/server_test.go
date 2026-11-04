@@ -91,4 +91,14 @@ func TestServeConnAdminAndUserIsolation(t *testing.T) {
 	if !userResp.OK {
 		t.Fatalf("expected user get_user_stats to succeed, got %+v", userResp)
 	}
+
+	// 4. Test CGI string-encoded int/bool query params ("limit":"100", "sync_users":"true") unmarshal cleanly
+	var req Request
+	rawQueryJSON := []byte(`{"action":"get_logs","limit":"100","sync_users":"true","backup_retention":"5"}`)
+	if err := json.Unmarshal(rawQueryJSON, &req); err != nil {
+		t.Fatalf("expected string-encoded numeric/bool fields to coerce cleanly, got error: %v", err)
+	}
+	if req.Limit != 100 || !req.SyncUsers || req.BackupRetention != 5 {
+		t.Fatalf("unexpected coerced request fields: %+v", req)
+	}
 }

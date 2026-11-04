@@ -84,6 +84,53 @@ function read_da_request(bool &$detectedPost): array
         }
     }
 
+    return normalize_ipc_payload($params);
+}
+
+function normalize_ipc_payload(array $params): array
+{
+    foreach (['limit', 'backup_retention'] as $intKey) {
+        if (isset($params[$intKey]) && !is_int($params[$intKey])) {
+            $strVal = trim((string) $params[$intKey]);
+            if ($strVal === '') {
+                unset($params[$intKey]);
+            } else {
+                $params[$intKey] = (int) $strVal;
+            }
+        }
+    }
+
+    foreach (['sync_users', 'keep_stored_token'] as $boolKey) {
+        if (isset($params[$boolKey]) && !is_bool($params[$boolKey])) {
+            $params[$boolKey] = filter_var($params[$boolKey], FILTER_VALIDATE_BOOLEAN);
+        }
+    }
+
+    if (isset($params['limits']) && is_array($params['limits'])) {
+        foreach (['enabled', 'custom_override'] as $bKey) {
+            if (isset($params['limits'][$bKey]) && !is_bool($params['limits'][$bKey])) {
+                $params['limits'][$bKey] = filter_var($params['limits'][$bKey], FILTER_VALIDATE_BOOLEAN);
+            }
+        }
+        $limitIntKeys = [
+            'cpu_quota',
+            'mem_high_mb',
+            'mem_max_mb',
+            'tasks_max',
+            'php_max_children',
+            'php_mem_limit_mb',
+            'mysql_max_connections',
+            'mysql_max_statement_time_sec',
+            'mysql_max_mem_mb',
+            'mysql_max_active_queries',
+        ];
+        foreach ($limitIntKeys as $iKey) {
+            if (isset($params['limits'][$iKey]) && !is_int($params['limits'][$iKey])) {
+                $params['limits'][$iKey] = (int) $params['limits'][$iKey];
+            }
+        }
+    }
+
     return $params;
 }
 
