@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build, Package & Publish GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go 1.22
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Run quality & unit test suite
+        run: |
+          go vet ./...
+          go test -v -race ./...
+          shopt -s globstar nullglob
+          shellcheck scripts/**/*.sh plugin/admin/api.raw plugin/user/stats.raw plugin/admin/index.html plugin/user/index.html
+          php -l plugin/admin/api.php
+          php -l plugin/user/stats.php
+
+      - name: Build multi-arch release archives & SHA-256 checksums
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          COMMIT=$(git rev-parse --short HEAD)
+          BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          CLEAN_VER="${TAG#v}"
+
+          mkdir -p release_out
+
+          for ARCH in amd64 arm64; do
+            STAGE="release_stage_${ARCH}/da-resource-limiter"
+            rm -rf "release_stage_${ARCH}"
+            mkdir -p "${STAGE}/bin"
+
+            GOOS=linux GOARCH="${ARCH}" CGO_ENABLED=0 go build -trimpath \
+              -ldflags "-s -w -X 'github.com/shostwp-byte/da-resourcelimiter/internal/version.Version=${TAG}' -X 'github.com/shostwp-byte/da-resourcelimiter/internal/version.Commit=${COMMIT}' -X 'github.com/shostwp-byte/da-resourcelimiter/internal/version.BuildTime=${BUILD_TIME}'" \
+              -o "${STAGE}/bin/da-resourced" ./cmd/da-resourced
+
+            chmod 0755 "${STAGE}/bin/da-resourced"
+            cp -a plugin "${STAGE}/plugin"
+            cp -a scripts "${STAGE}/scripts"
+            cp -a systemd "${STAGE}/systemd"
+            sed -i "s/^version=.*/version=${CLEAN_VER}/" "${STAGE}/plugin/plugin.conf"
+
+            chmod 0755 \
+              "${STAGE}/plugin/admin/index.html" \
+              "${STAGE}/plugin/admin/api.raw" \
+              "${STAGE}/plugin/user/index.html" \
+              "${STAGE}/plugin/user/stats.raw" \
+              "${STAGE}/scripts"/*.sh \
+              "${STAGE}/scripts/da_hooks"/*.sh
+
+            printf '{\n  "version": "%s",\n  "commit": "%s",\n  "built_at": "%s",\n  "arch": "%s",\n  "min_mariadb": "10.5",\n  "config_schema_version": 1\n}\n' \
+              "${TAG}" "${COMMIT}" "${BUILD_TIME}" "${ARCH}" > "${STAGE}/manifest.json"
+
+            tar -czf "release_out/da-resource-limiter-linux-${ARCH}.tar.gz" -C "release_stage_${ARCH}" da-resource-limiter
+          done
+
+          cp "release_stage_amd64/da-resource-limiter/manifest.json" release_out/manifest.json
+          (
+            cd release_out
+            sha256sum da-resource-limiter-linux-amd64.tar.gz da-resource-limiter-linux-arm64.tar.gz manifest.json > checksums.txt
+          )
+          cat release_out/checksums.txt
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          PRERELEASE_FLAG=""
+          if [[ "$TAG" == *"-"* ]]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          gh release create "$TAG" \
+            release_out/da-resource-limiter-linux-amd64.tar.gz \
+            release_out/da-resource-limiter-linux-arm64.tar.gz \
+            release_out/manifest.json \
+            release_out/checksums.txt \
+            --title "DA-ResourceLimiter ${TAG}" \
+            --generate-notes \
+            $PRERELEASE_FLAG

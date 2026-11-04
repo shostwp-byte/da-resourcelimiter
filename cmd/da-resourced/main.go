@@ -22,6 +22,7 @@ import (
 	"github.com/shostwp-byte/da-resourcelimiter/internal/ipc"
 	"github.com/shostwp-byte/da-resourcelimiter/internal/logger"
 	"github.com/shostwp-byte/da-resourcelimiter/internal/mysqlgov"
+	"github.com/shostwp-byte/da-resourcelimiter/internal/updater"
 	"github.com/shostwp-byte/da-resourcelimiter/internal/version"
 )
 
@@ -35,7 +36,7 @@ const (
 	DefaultProcRoot       = "/proc"
 )
 
-func buildEngine() *engine.Engine {
+func buildEngine() (*engine.Engine, *updater.Service) {
 	dataDir := getenvOr("DA_LIMITER_DATA_DIR", DefaultDataDir)
 	updaterPath := getenvOr("DA_LIMITER_UPDATER_CONF", DefaultUpdaterCfgPath)
 	daDataRoot := getenvOr("DA_LIMITER_DA_DATA_ROOT", DefaultDADataRoot)
@@ -62,7 +63,10 @@ func buildEngine() *engine.Engine {
 		return store.ResolveUserLimits(acct.Username, acct.Package)
 	}, vlog, penaltyPath)
 
-	return engine.New(store, reg, cgMgr, cls, gov, vlog, daDataRoot, passwdPath)
+	upd := updater.NewService(store)
+	eng := engine.New(store, reg, cgMgr, cls, gov, vlog, daDataRoot, passwdPath)
+	eng.Updater = upd
+	return eng, upd
 }
 
 func main() {
@@ -77,6 +81,11 @@ func main() {
 	switch os.Args[1] {
 	case "version", "-v", "--version":
 		fmt.Println(version.Info())
+
+	case "ping":
+		if err := runPing(os.Args[2:]); err != nil {
+			log.Fatalf("ping failed: %v", err)
+		}
 
 	case "serve":
 		if err := runServe(os.Args[2:]); err != nil {
@@ -123,6 +132,21 @@ func main() {
 			log.Fatalf("audit-mycnf failed: %v", err)
 		}
 
+	case "check-update":
+		if err := runCheckUpdate(); err != nil {
+			log.Fatalf("check-update failed: %v", err)
+		}
+
+	case "update":
+		if err := runUpdate(os.Args[2:]); err != nil {
+			log.Fatalf("update failed: %v", err)
+		}
+
+	case "rollback":
+		if err := runRollback(); err != nil {
+			log.Fatalf("rollback failed: %v", err)
+		}
+
 	case "help", "-h", "--help":
 		printUsage()
 
@@ -136,6 +160,7 @@ func main() {
 func printUsage() {
 	fmt.Printf("%s\n\nUsage:\n", version.Info())
 	fmt.Println("  da-resourced serve                           Run root daemon (Cgroups v2 + MariaDB Governor + IPC Socket)")
+	fmt.Println("  da-resourced ping                            Healthcheck live daemon over Unix socket")
 	fmt.Println("  da-resourced apply <username>                Apply OS, PHP-FPM & MariaDB limits for a user")
 	fmt.Println("  da-resourced apply-all                       Batch-apply limits to all DirectAdmin users")
 	fmt.Println("  da-resourced apply-package <package>         Sync limits to all non-overridden users in package")
@@ -144,7 +169,32 @@ func printUsage() {
 	fmt.Println("  da-resourced unblock <username>              Immediately lift MySQL Penalty Box for a user")
 	fmt.Println("  da-resourced stats [username] [--json]       Display live Cgroups v2 & MariaDB usage metrics")
 	fmt.Println("  da-resourced audit-mycnf [/etc/my.cnf]       Audit MariaDB Tier-1 per-thread memory settings")
+	fmt.Println("  da-resourced check-update                    Check GitHub Releases for newer version")
+	fmt.Println("  da-resourced update [--version vX.Y.Z]       Download, verify SHA-256 & atomically update from GitHub")
+	fmt.Println("  da-resourced rollback                        Restore previous snapshot from /var/backups/da-resource-limiter")
 	fmt.Println("  da-resourced version                         Print build version information")
+}
+
+func runPing(args []string) error {
+	fs := flag.NewFlagSet("ping", flag.ContinueOnError)
+	sock := fs.String("sock", ipc.DefaultAdminSocketPath, "Admin Unix socket path")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	resp, err := ipc.SendRequest(ctx, *sock, ipc.Request{Action: ipc.ActionPing})
+	if err != nil {
+		return err
+	}
+	if !resp.OK {
+		return errors.New(resp.Error)
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(resp.Data)
 }
 
 func runServe(args []string) error {
@@ -159,7 +209,7 @@ func runServe(args []string) error {
 		return err
 	}
 
-	eng := buildEngine()
+	eng, _ := buildEngine()
 	if err := eng.CgroupMgr.VerifyUnifiedHierarchy(); err != nil {
 		return err
 	}
@@ -180,7 +230,7 @@ func runServe(args []string) error {
 	if err := eng.ApplyAll(ctx); err != nil {
 		log.Printf("warning: initial user limits sync: %v", err)
 	}
-	eng.CheckOOMEvents() // Seed baseline OOM counters
+	eng.CheckOOMEvents()
 
 	ipcServer := ipc.NewServer(*adminSock, *userSock, eng)
 	if err := ipcServer.Start(ctx); err != nil {
@@ -243,7 +293,6 @@ func runApplyUser(args []string) error {
 	if len(args) < 1 {
 		return errors.New("usage: da-resourced apply <username>")
 	}
-	// Prefer routing through running daemon socket if active so live state stays synchronized
 	if resp, err := ipc.SendRequest(context.Background(), ipc.DefaultAdminSocketPath, ipc.Request{
 		Action:   ipc.ActionApplyUserLimits,
 		Username: args[0],
@@ -255,7 +304,7 @@ func runApplyUser(args []string) error {
 		return nil
 	}
 
-	eng := buildEngine()
+	eng, _ := buildEngine()
 	if err := eng.CgroupMgr.VerifyUnifiedHierarchy(); err != nil {
 		return err
 	}
@@ -266,7 +315,7 @@ func runApplyUser(args []string) error {
 }
 
 func runApplyAll() error {
-	eng := buildEngine()
+	eng, _ := buildEngine()
 	if err := eng.CgroupMgr.VerifyUnifiedHierarchy(); err != nil {
 		return err
 	}
@@ -291,7 +340,7 @@ func runApplyPackage(args []string) error {
 		return nil
 	}
 
-	eng := buildEngine()
+	eng, _ := buildEngine()
 	if err := eng.CgroupMgr.VerifyUnifiedHierarchy(); err != nil {
 		return err
 	}
@@ -322,7 +371,7 @@ func runApplyDBUser(args []string) error {
 		return nil
 	}
 
-	eng := buildEngine()
+	eng, _ := buildEngine()
 	_ = eng.Registry.Reload()
 	return eng.ApplyNewDBUser(context.Background(), args[0], args[1])
 }
@@ -342,7 +391,7 @@ func runRemoveUser(args []string) error {
 		return nil
 	}
 
-	eng := buildEngine()
+	eng, _ := buildEngine()
 	_ = eng.Registry.Reload()
 	return eng.RemoveUser(context.Background(), args[0])
 }
@@ -362,7 +411,7 @@ func runUnblock(args []string) error {
 		return nil
 	}
 
-	eng := buildEngine()
+	eng, _ := buildEngine()
 	_ = eng.Registry.Reload()
 	return eng.MySQLGov.UnblockUser(context.Background(), args[0])
 }
@@ -379,7 +428,7 @@ func runStats(args []string) error {
 		targetUser = fs.Arg(0)
 	}
 
-	eng := buildEngine()
+	eng, _ := buildEngine()
 	if err := eng.Registry.Reload(); err != nil {
 		return err
 	}
@@ -449,6 +498,37 @@ func runAuditMyCnf(args []string) error {
 	_ = tw.Flush()
 	fmt.Printf("\nRecommended snippet:\n\n%s", mysqlgov.RecommendedMyCnfSnippet())
 	return nil
+}
+
+func runCheckUpdate() error {
+	_, upd := buildEngine()
+	st, err := upd.CheckLatest(context.Background())
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Repository      : %s (%s)\n", st.GitHubRepo, st.UpdateChannel)
+	fmt.Printf("Current Version : %s\n", st.CurrentVersion)
+	fmt.Printf("Latest Version  : %s\n", st.LatestVersion)
+	fmt.Printf("Update Available: %v\n", st.UpdateAvailable)
+	if st.ReleaseNotes != "" {
+		fmt.Printf("\nRelease Notes:\n%s\n", st.ReleaseNotes)
+	}
+	return nil
+}
+
+func runUpdate(args []string) error {
+	fs := flag.NewFlagSet("update", flag.ContinueOnError)
+	targetVer := fs.String("version", "", "Optional specific release tag (e.g. v1.2.0); defaults to latest")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	_, upd := buildEngine()
+	return upd.RunCLIUpdate(context.Background(), *targetVer)
+}
+
+func runRollback() error {
+	_, upd := buildEngine()
+	return upd.RunCLIRollback(context.Background())
 }
 
 func getenvOr(key, fallback string) string {
