@@ -2,62 +2,377 @@
 cat <<'DARL_USER_HTML'
 <div id="darl-user-root">
   <style>
+    :where(div, section, article, main):has(#darl-user-root) {
+      max-width: 100% !important;
+    }
     #darl-user-root {
-      --bg: #f8fafc;
+      --bg-top: #f8fafc;
+      --bg-bot: #f1f5f9;
       --card: #ffffff;
       --border: #e2e8f0;
+      --border-strong: #cbd5e1;
       --text: #0f172a;
+      --text-soft: #334155;
       --muted: #64748b;
       --primary: #0284c7;
+      --primary-light: #e0f2fe;
       --success: #16a34a;
       --warn: #d97706;
       --danger: #dc2626;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
       color: var(--text);
-      background: var(--bg);
-      padding: 18px;
-      border-radius: 10px;
+      background: linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bot) 100%);
+      border: 1px solid var(--border);
+      padding: 24px 28px;
+      border-radius: 14px;
+      width: 100%;
+      max-width: 1680px;
+      margin: 0 auto;
       box-sizing: border-box;
+      box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
     }
     #darl-user-root * { box-sizing: border-box; }
+    @media (max-width: 768px) {
+      #darl-user-root { padding: 16px; border-radius: 10px; }
+    }
+
     .du-header {
-      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
-      gap: 10px; margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid var(--border);
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 20px;
+      padding: 18px 22px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
     }
-    .du-grid {
-      display: grid; grid-template-columns: repeat(auto-fit, minmax(235px, 1fr));
-      gap: 14px; margin-bottom: 16px;
+    .du-brand {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      min-width: 0;
     }
-    .du-card {
-      background: var(--card); border: 1px solid var(--border); border-radius: 9px; padding: 15px;
+    .du-icon-box {
+      width: 46px;
+      height: 46px;
+      border-radius: 11px;
+      background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+      border: 1px solid #bae6fd;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
     }
-    .du-label { font-size: 12.5px; font-weight: 600; color: var(--muted); }
-    .du-val { font-size: 20px; font-weight: 700; margin: 6px 0 8px 0; }
-    .du-sub { font-size: 12px; color: var(--muted); margin-top: 6px; }
-    .du-bar { height: 9px; background: #e2e8f0; border-radius: 999px; overflow: hidden; }
-    .du-bar > span { display: block; height: 100%; background: var(--primary); transition: width .25s ease; }
-    .du-bar > span.warn { background: var(--warn); }
-    .du-bar > span.crit { background: var(--danger); }
-    .du-alert {
-      display: none; padding: 12px 15px; border-radius: 8px; margin-bottom: 16px;
-      background: #fee2e2; border: 1px solid #fca5a5; color: #991b1b; font-size: 13.5px;
+    .du-title {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.015em;
+      color: var(--text);
+      line-height: 1.25;
+    }
+    .du-meta-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      margin-top: 6px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .du-meta-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 9px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      background: #f1f5f9;
+      color: var(--text-soft);
+      border: 1px solid var(--border);
+    }
+    .du-header-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .du-live-indicator {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: #f0fdf4;
+      border: 1px solid #bbf7d0;
+      color: #15803d;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .du-live-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #22c55e;
+      box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.2);
     }
     .du-btn {
-      padding: 7px 12px; border: 1px solid #cbd5e1; background: #fff; border-radius: 6px;
-      font-size: 13px; font-weight: 600; cursor: pointer; color: var(--text);
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 8px 14px;
+      border: 1px solid var(--border-strong);
+      background: #ffffff;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      color: var(--text);
+      transition: all 0.15s ease;
     }
-    .du-btn:hover { background: #f1f5f9; }
-    table.du-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+    .du-btn:hover {
+      background: #f8fafc;
+      border-color: #94a3b8;
+    }
+
+    .du-alert {
+      display: none;
+      padding: 14px 18px;
+      border-radius: 10px;
+      margin-bottom: 20px;
+      background: #fef2f2;
+      border: 1px solid #fecaca;
+      border-left: 4px solid var(--danger);
+      color: #991b1b;
+      font-size: 13.5px;
+      font-weight: 500;
+      line-height: 1.5;
+    }
+
+    .du-metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 18px;
+      margin-bottom: 20px;
+    }
+    @media (max-width: 1220px) {
+      .du-metrics-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 640px) {
+      .du-metrics-grid { grid-template-columns: 1fr; }
+    }
+
+    .du-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 18px 20px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    .du-card:hover {
+      border-color: #cbd5e1;
+      box-shadow: 0 4px 12px rgba(15, 23, 42, 0.04);
+    }
+
+    .du-card-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .du-label-wrap {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-width: 0;
+    }
+    .du-mini-icon {
+      width: 30px;
+      height: 30px;
+      border-radius: 8px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    .du-icon-cpu { background: #e0f2fe; color: #0284c7; }
+    .du-icon-ram { background: #ede9fe; color: #7c3aed; }
+    .du-icon-proc { background: #dcfce7; color: #16a34a; }
+    .du-icon-sql { background: #fef3c7; color: #d97706; }
+
+    .du-label {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--muted);
+      line-height: 1.3;
+    }
+    .du-pct-badge {
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11.5px;
+      font-weight: 700;
+      background: #f1f5f9;
+      color: var(--text-soft);
+      font-variant-numeric: tabular-nums;
+      flex-shrink: 0;
+    }
+    .du-pct-badge.warn { background: #fef3c7; color: #92400e; }
+    .du-pct-badge.crit { background: #fee2e2; color: #991b1b; }
+
+    .du-val {
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      margin: 4px 0 12px 0;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+    }
+    .du-bar {
+      height: 10px;
+      background: #e2e8f0;
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .du-bar > span {
+      display: block;
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, #0ea5e9 0%, #0284c7 100%);
+      transition: width 0.3s ease;
+    }
+    .du-bar > span.warn {
+      background: linear-gradient(90deg, #f59e0b 0%, #d97706 100%);
+    }
+    .du-bar > span.crit {
+      background: linear-gradient(90deg, #ef4444 0%, #dc2626 100%);
+    }
+    .du-sub {
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 10px;
+      padding-top: 9px;
+      border-top: 1px dashed #e2e8f0;
+      line-height: 1.45;
+    }
+
+    .du-bottom-layout {
+      display: grid;
+      grid-template-columns: 390px minmax(0, 1fr);
+      gap: 18px;
+      align-items: stretch;
+    }
+    @media (max-width: 1100px) {
+      .du-bottom-layout { grid-template-columns: 1fr; }
+    }
+
+    .du-section-title {
+      margin: 0 0 4px 0;
+      font-size: 15.5px;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .du-section-desc {
+      font-size: 12.5px;
+      color: var(--muted);
+      margin-bottom: 14px;
+      line-height: 1.45;
+    }
+
+    .du-events-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .du-event-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 14px;
+      padding: 14px 16px;
+      border-radius: 10px;
+      background: #f8fafc;
+      border: 1px solid var(--border);
+    }
+    .du-event-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 3px;
+    }
+    .du-event-sub {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.4;
+    }
+    .du-event-count {
+      font-size: 24px;
+      font-weight: 800;
+      font-variant-numeric: tabular-nums;
+      padding: 6px 14px;
+      border-radius: 9px;
+      background: #ffffff;
+      border: 1px solid var(--border);
+      min-width: 58px;
+      text-align: center;
+      color: var(--text);
+      flex-shrink: 0;
+    }
+
+    .du-table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    table.du-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
     table.du-table th, table.du-table td {
-      padding: 9px 10px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top;
+      padding: 11px 14px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
     }
-    table.du-table th { background: #f8fafc; color: var(--muted); font-weight: 600; }
+    table.du-table tr:last-child td { border-bottom: none; }
+    table.du-table th {
+      background: #f8fafc;
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      white-space: nowrap;
+    }
+    table.du-table tbody tr:hover { background: #f8fafc; }
+    .du-empty-state {
+      padding: 28px 16px !important;
+      text-align: center !important;
+      color: var(--muted);
+      font-size: 13.5px;
+    }
     .du-mono {
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 12px; background: #f1f5f9; padding: 5px 8px; border-radius: 5px; word-break: break-all;
+      font-size: 12px;
+      background: #f1f5f9;
+      border: 1px solid #e2e8f0;
+      padding: 6px 10px;
+      border-radius: 6px;
+      word-break: break-all;
+      color: #1e293b;
     }
     .du-pill {
-      display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 600;
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 11.5px;
+      font-weight: 600;
+      white-space: nowrap;
     }
     .du-pill-ok { background: #dcfce7; color: #166534; }
     .du-pill-warn { background: #fef3c7; color: #92400e; }
@@ -65,9 +380,9 @@ cat <<'DARL_USER_HTML'
   </style>
 
   <div class="du-header">
-    <div>
-      <h2 style="margin:0;font-size:19px;display:flex;align-items:center;gap:9px;">
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="26" height="26" fill="none" style="flex-shrink:0;">
+    <div class="du-brand">
+      <div class="du-icon-box">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="28" height="28" fill="none">
           <path d="M26 44L24 54M38 44L40 54" stroke="#0284C7" stroke-width="4" stroke-linecap="round"/>
           <path d="M18 54H46" stroke="#0284C7" stroke-width="4.5" stroke-linecap="round"/>
           <rect x="6" y="8" width="52" height="36" rx="6" fill="#0F172A" stroke="#0EA5E9" stroke-width="3.8"/>
@@ -76,102 +391,266 @@ cat <<'DARL_USER_HTML'
           <rect x="34" y="27" width="6" height="12" rx="1.5" fill="#38BDF8"/>
           <rect x="44" y="20" width="6" height="19" rx="1.5" fill="#F59E0B"/>
         </svg>
-        <span>Tài Nguyên Sử Dụng Thực Tế (Resource Usage)</span>
-      </h2>
-      <div id="du-acct-meta" style="font-size:12.5px;color:var(--muted);margin-top:3px;">Đang tải thông số tài khoản...</div>
+      </div>
+      <div>
+        <h2 class="du-title">Tài Nguyên Sử Dụng Thực Tế (Resource Usage)</h2>
+        <div id="du-acct-meta" class="du-meta-row">Đang tải thông số tài khoản...</div>
+      </div>
     </div>
-    <button type="button" class="du-btn" id="du-refresh">Làm mới (Auto 5s)</button>
+    <div class="du-header-actions">
+      <span class="du-live-indicator"><span class="du-live-dot"></span>Auto 5s</span>
+      <button type="button" class="du-btn" id="du-refresh">
+        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
+        <span>Làm mới ngay</span>
+      </button>
+    </div>
   </div>
 
   <div id="du-penalty-banner" class="du-alert"></div>
 
-  <div class="du-grid">
+  <div class="du-metrics-grid">
     <div class="du-card">
-      <div class="du-label">CPU Usage</div>
+      <div class="du-card-top">
+        <div class="du-label-wrap">
+          <span class="du-mini-icon du-icon-cpu">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/></svg>
+          </span>
+          <span class="du-label">CPU Usage</span>
+        </div>
+        <span class="du-pct-badge" id="du-cpu-pct">0%</span>
+      </div>
       <div class="du-val" id="du-cpu-text">-</div>
       <div class="du-bar"><span id="du-cpu-bar" style="width:0%"></span></div>
       <div class="du-sub" id="du-cpu-sub">100% tương đương 1 vCore xử lý</div>
     </div>
 
     <div class="du-card">
-      <div class="du-label">Physical Memory (RAM)</div>
+      <div class="du-card-top">
+        <div class="du-label-wrap">
+          <span class="du-mini-icon du-icon-ram">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 19v-3M10 19v-3M14 19v-3M18 19v-3M8 11V9M16 11V9M12 11V9M2 15h20M4 5h16a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z"/></svg>
+          </span>
+          <span class="du-label">Physical Memory (RAM)</span>
+        </div>
+        <span class="du-pct-badge" id="du-ram-pct">0%</span>
+      </div>
       <div class="du-val" id="du-ram-text">-</div>
       <div class="du-bar"><span id="du-ram-bar" style="width:0%"></span></div>
       <div class="du-sub" id="du-ram-sub">Ngưỡng bóp mềm (MemoryHigh): -</div>
     </div>
 
     <div class="du-card">
-      <div class="du-label">Active Processes (PHP / Cron / SSH)</div>
+      <div class="du-card-top">
+        <div class="du-label-wrap">
+          <span class="du-mini-icon du-icon-proc">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+          </span>
+          <span class="du-label">Active Processes (PHP / Cron)</span>
+        </div>
+        <span class="du-pct-badge" id="du-proc-pct">0%</span>
+      </div>
       <div class="du-val" id="du-proc-text">-</div>
       <div class="du-bar"><span id="du-proc-bar" style="width:0%"></span></div>
       <div class="du-sub" id="du-proc-sub">Tối đa PHP-FPM Workers: -</div>
     </div>
 
     <div class="du-card">
-      <div class="du-label">MySQL / MariaDB Memory &amp; Connections</div>
+      <div class="du-card-top">
+        <div class="du-label-wrap">
+          <span class="du-mini-icon du-icon-sql">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+          </span>
+          <span class="du-label">MySQL / MariaDB Memory</span>
+        </div>
+        <span class="du-pct-badge" id="du-sql-pct">0%</span>
+      </div>
       <div class="du-val" id="du-sql-text">-</div>
       <div class="du-bar"><span id="du-sql-bar" style="width:0%"></span></div>
       <div class="du-sub" id="du-sql-sub">Kết nối hiện tại: -</div>
     </div>
   </div>
 
-  <div class="du-grid" style="grid-template-columns:repeat(auto-fit, minmax(200px, 1fr));">
+  <div class="du-bottom-layout">
     <div class="du-card">
-      <div class="du-label">Chạm ngưỡng RAM mềm (MemoryHigh)</div>
-      <div class="du-val" id="du-cnt-high">0</div>
-      <div class="du-sub">Lần hệ thống thu hồi bộ nhớ đệm để tránh OOM</div>
-    </div>
-    <div class="du-card">
-      <div class="du-label">Sự kiện Tràn RAM (OOM Kills - 24h qua)</div>
-      <div class="du-val" id="du-cnt-oom">0</div>
-      <div class="du-sub">Tiến trình vượt ngưỡng cứng MemoryMax bị dừng</div>
-    </div>
-    <div class="du-card">
-      <div class="du-label">Truy vấn SQL bị ngắt (24h qua)</div>
-      <div class="du-val" id="du-cnt-sql">0</div>
-      <div class="du-sub">Do chạy quá thời gian hoặc vượt RAM MySQL cho phép</div>
-    </div>
-  </div>
+      <h3 class="du-section-title">Thống Kê Bảo Vệ Hệ Thống (24h)</h3>
+      <div class="du-section-desc">Bộ đếm tự động bảo vệ website khỏi tình trạng treo tiến trình hoặc cạn kiệt bộ nhớ.</div>
 
-  <div class="du-card">
-    <h3 style="margin:0 0 6px 0;font-size:15px;">Top 5 Câu Lệnh SQL Nặng / Chậm Bị Ngắt Gần Nhất</h3>
-    <div style="font-size:12.5px;color:var(--muted);margin-bottom:8px;">
-      Sử dụng danh sách dưới đây để kiểm tra và bổ sung Index cho bảng cơ sở dữ liệu nhằm tối ưu tốc độ website.
+      <div class="du-events-stack">
+        <div class="du-event-item">
+          <div>
+            <div class="du-event-title">Chạm ngưỡng RAM mềm (MemoryHigh)</div>
+            <div class="du-event-sub">Lần hệ thống thu hồi bộ nhớ đệm để tránh OOM</div>
+          </div>
+          <div class="du-event-count" id="du-cnt-high">0</div>
+        </div>
+
+        <div class="du-event-item">
+          <div>
+            <div class="du-event-title">Sự kiện Tràn RAM (OOM Kills - 24h)</div>
+            <div class="du-event-sub">Tiến trình vượt ngưỡng cứng MemoryMax bị dừng</div>
+          </div>
+          <div class="du-event-count" id="du-cnt-oom">0</div>
+        </div>
+
+        <div class="du-event-item">
+          <div>
+            <div class="du-event-title">Truy vấn SQL bị ngắt (24h qua)</div>
+            <div class="du-event-sub">Do chạy quá thời gian hoặc vượt RAM MySQL cho phép</div>
+          </div>
+          <div class="du-event-count" id="du-cnt-sql">0</div>
+        </div>
+      </div>
     </div>
-    <div style="overflow-x:auto;">
-      <table class="du-table">
-        <thead>
-          <tr>
-            <th>Thời gian (UTC)</th>
-            <th>Nguyên nhân</th>
-            <th>Tài nguyên / Thời gian</th>
-            <th>Nội dung truy vấn SQL</th>
-          </tr>
-        </thead>
-        <tbody id="du-sql-tbody">
-          <tr><td colspan="4" style="text-align:center;color:var(--muted);">Không có truy vấn SQL nào bị ngắt.</td></tr>
-        </tbody>
-      </table>
+
+    <div class="du-card" style="display:flex;flex-direction:column;">
+      <h3 class="du-section-title">Top 5 Câu Lệnh SQL Nặng / Chậm Bị Ngắt Gần Nhất</h3>
+      <div class="du-section-desc">
+        Sử dụng danh sách dưới đây để kiểm tra và bổ sung Index cho bảng cơ sở dữ liệu nhằm tối ưu tốc độ website.
+      </div>
+      <div class="du-table-wrap" style="flex:1;">
+        <table class="du-table">
+          <thead>
+            <tr>
+              <th>Thời gian (UTC)</th>
+              <th>Nguyên nhân</th>
+              <th>Tài nguyên / Thời gian</th>
+              <th>Nội dung truy vấn SQL</th>
+            </tr>
+          </thead>
+          <tbody id="du-sql-tbody">
+            <tr><td colspan="4" class="du-empty-state">Không có truy vấn SQL nào bị ngắt.</td></tr>
+          </tbody>
+        </table>
+      </div>
     </div>
   </div>
 
   <script>
     (function () {
+      const ROOT_ID = 'darl-user-root';
       const STATS_URL = '/CMD_PLUGINS/da_resource_limiter/stats.raw?action=get_user_stats';
+      const modifiedNodes = new Map();
+
+      function rememberAndSetStyle(el, prop, val) {
+        if (!modifiedNodes.has(el)) {
+          modifiedNodes.set(el, el.getAttribute('style'));
+        }
+        el.style.setProperty(prop, val, 'important');
+      }
+
+      function restoreContainerStyles() {
+        modifiedNodes.forEach(function (origStyle, el) {
+          try {
+            if (!el) return;
+            if (origStyle === null) el.removeAttribute('style');
+            else el.setAttribute('style', origStyle);
+          } catch (_) {}
+        });
+        modifiedNodes.clear();
+      }
+
+      function hasHorizontalSibling(el) {
+        const p = el.parentElement;
+        if (!p) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return false;
+        const win = el.ownerDocument.defaultView || window;
+        for (let i = 0; i < p.children.length; i++) {
+          const sib = p.children[i];
+          if (sib === el) continue;
+          const tag = sib.tagName;
+          if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LINK') continue;
+          const cs = win.getComputedStyle(sib);
+          if (cs.display === 'none' || cs.visibility === 'hidden' || cs.position === 'fixed' || cs.position === 'absolute') continue;
+          const sr = sib.getBoundingClientRect();
+          if (sr.width < 24 || sr.height < 24 || sr.right <= 0 || sr.bottom <= 0) continue;
+          const vOverlap = Math.min(r.bottom, sr.bottom) - Math.max(r.top, sr.top);
+          if (vOverlap > 24 && (sr.right <= r.left + 12 || sr.left >= r.right - 12)) {
+            return true;
+          }
+        }
+        return false;
+      }
+
+      function widenChainFrom(startEl) {
+        if (!startEl) return;
+        const doc = startEl.ownerDocument;
+        const win = doc.defaultView || window;
+        let el = startEl;
+        let depth = 0;
+        while (el && el !== doc.body && el !== doc.documentElement && depth < 14) {
+          const cs = win.getComputedStyle(el);
+          if (hasHorizontalSibling(el)) {
+            if (cs.maxWidth && cs.maxWidth !== 'none') {
+              rememberAndSetStyle(el, 'max-width', 'none');
+            }
+            rememberAndSetStyle(el, 'min-width', '0');
+            const pcs = el.parentElement ? win.getComputedStyle(el.parentElement) : null;
+            if (pcs && (pcs.display === 'flex' || pcs.display === 'inline-flex')) {
+              rememberAndSetStyle(el, 'flex', '1 1 0%');
+            } else if (pcs && (pcs.display === 'grid' || pcs.display === 'inline-grid')) {
+              rememberAndSetStyle(el, 'width', '100%');
+            }
+            break;
+          }
+          rememberAndSetStyle(el, 'max-width', '100%');
+          rememberAndSetStyle(el, 'width', '100%');
+          if ((cs.display === 'grid' || cs.display === 'inline-grid') && el.children.length === 1) {
+            rememberAndSetStyle(el, 'grid-template-columns', 'minmax(0, 1fr)');
+          }
+          const padL = parseFloat(cs.paddingLeft) || 0;
+          const padR = parseFloat(cs.paddingRight) || 0;
+          if (padL > 48 && padR > 48) {
+            rememberAndSetStyle(el, 'padding-left', '24px');
+            rememberAndSetStyle(el, 'padding-right', '24px');
+          }
+          el = el.parentElement;
+          depth++;
+        }
+      }
+
+      function expandEvolutionContainer() {
+        const root = document.getElementById(ROOT_ID);
+        if (!root) return;
+        if (root.parentElement) {
+          widenChainFrom(root.parentElement);
+        }
+        try {
+          if (window.frameElement && window.parent && window.parent !== window && window.parent.document) {
+            widenChainFrom(window.frameElement);
+          }
+        } catch (_) {}
+      }
+
+      expandEvolutionContainer();
+      if (typeof window.requestAnimationFrame === 'function') {
+        window.requestAnimationFrame(expandEvolutionContainer);
+      }
+      setTimeout(expandEvolutionContainer, 150);
 
       function esc(v) {
         return String(v === undefined || v === null ? '' : v)
           .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
       }
 
-      function setBar(id, cur, max) {
-        const el = document.getElementById(id);
-        const pct = max > 0 ? Math.min(100, Math.round((cur / max) * 100)) : 0;
-        el.style.width = pct + '%';
-        el.className = pct >= 90 ? 'crit' : (pct >= 75 ? 'warn' : '');
+      function setBar(barId, pctId, cur, max, unlimited) {
+        const el = document.getElementById(barId);
+        const pctEl = document.getElementById(pctId);
+        const pct = (!unlimited && max > 0) ? Math.min(100, Math.round((cur / max) * 100)) : 0;
+        const tone = pct >= 90 ? 'crit' : (pct >= 75 ? 'warn' : '');
+        if (el) {
+          el.style.width = pct + '%';
+          el.className = tone;
+        }
+        if (pctEl) {
+          pctEl.textContent = unlimited ? '∞' : (pct + '%');
+          pctEl.className = 'du-pct-badge' + (tone ? ' ' + tone : '');
+        }
       }
 
       async function refreshStats() {
+        const root = document.getElementById(ROOT_ID);
+        if (!root) return;
         try {
           const res = await fetch(STATS_URL, { credentials: 'same-origin' });
           const r = await res.json();
@@ -181,8 +660,13 @@ cat <<'DARL_USER_HTML'
           }
           const s = r.data.snapshot;
           const lim = s.limits || {};
-          document.getElementById('du-acct-meta').textContent =
-            'Tài khoản: ' + s.username + ' | Gói Hosting: ' + (s.package || 'default');
+          const unlimited = lim.enabled === false;
+          document.getElementById('du-acct-meta').innerHTML =
+            '<span class="du-meta-chip">Tài khoản: <strong>' + esc(s.username) + '</strong></span>' +
+            '<span class="du-meta-chip">Gói Hosting: <strong>' + esc(s.package || 'default') + '</strong></span>' +
+            (unlimited
+              ? '<span class="du-pill du-pill-warn">Miễn trừ giới hạn</span>'
+              : '<span class="du-pill du-pill-ok">Bảo vệ tài nguyên: Đang bật</span>');
 
           const banner = document.getElementById('du-penalty-banner');
           if (s.penalty_active) {
@@ -193,16 +677,15 @@ cat <<'DARL_USER_HTML'
             banner.style.display = 'none';
           }
 
-          const unlimited = lim.enabled === false;
           document.getElementById('du-cpu-text').textContent = unlimited
             ? (s.cpu_percent || 0).toFixed(1) + '% / Không giới hạn'
             : (s.cpu_percent || 0).toFixed(1) + '% / ' + (lim.cpu_quota || 0) + '%';
-          setBar('du-cpu-bar', unlimited ? 0 : (s.cpu_percent || 0), lim.cpu_quota || 100);
+          setBar('du-cpu-bar', 'du-cpu-pct', s.cpu_percent || 0, lim.cpu_quota || 100, unlimited);
 
           document.getElementById('du-ram-text').textContent = unlimited
             ? (s.memory_current_mb || 0).toFixed(1) + ' MB / Không giới hạn'
             : (s.memory_current_mb || 0).toFixed(1) + ' MB / ' + (lim.mem_max_mb || 0) + ' MB';
-          setBar('du-ram-bar', unlimited ? 0 : (s.memory_current_mb || 0), lim.mem_max_mb || 1024);
+          setBar('du-ram-bar', 'du-ram-pct', s.memory_current_mb || 0, lim.mem_max_mb || 1024, unlimited);
           document.getElementById('du-ram-sub').textContent = unlimited
             ? 'Tài khoản miễn trừ giới hạn tài nguyên'
             : 'Ngưỡng bóp mềm (MemoryHigh): ' + (lim.mem_high_mb || 0) + ' MB';
@@ -210,7 +693,7 @@ cat <<'DARL_USER_HTML'
           document.getElementById('du-proc-text').textContent = unlimited
             ? (s.active_processes || 0) + ' / Không giới hạn'
             : (s.active_processes || 0) + ' / ' + (lim.tasks_max || 0);
-          setBar('du-proc-bar', unlimited ? 0 : (s.active_processes || 0), lim.tasks_max || 100);
+          setBar('du-proc-bar', 'du-proc-pct', s.active_processes || 0, lim.tasks_max || 100, unlimited);
           document.getElementById('du-proc-sub').textContent = unlimited
             ? 'PHP Workers: Không giới hạn'
             : 'PHP Max Children: ' + (lim.php_max_children || 0) + ' (' + (lim.php_mem_limit_mb || 0) + 'MB/worker)';
@@ -218,7 +701,7 @@ cat <<'DARL_USER_HTML'
           document.getElementById('du-sql-text').textContent = unlimited
             ? (s.mysql_memory_mb || 0).toFixed(1) + ' MB / Không giới hạn'
             : (s.mysql_memory_mb || 0).toFixed(1) + ' MB / ' + (lim.mysql_max_mem_mb || 0) + ' MB';
-          setBar('du-sql-bar', unlimited ? 0 : (s.mysql_memory_mb || 0), lim.mysql_max_mem_mb || 256);
+          setBar('du-sql-bar', 'du-sql-pct', s.mysql_memory_mb || 0, lim.mysql_max_mem_mb || 256, unlimited);
           document.getElementById('du-sql-sub').textContent = unlimited
             ? 'Kết nối MySQL: Không áp trần giới hạn'
             : 'Kết nối: ' + (s.mysql_total_conns || 0) + ' / ' + (lim.mysql_max_connections || 0) +
@@ -231,7 +714,7 @@ cat <<'DARL_USER_HTML'
           const top = r.data.top_killed_queries || [];
           const tbody = document.getElementById('du-sql-tbody');
           if (!top.length) {
-            tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted);">Tuyệt vời! Không có câu lệnh SQL nào bị ngắt gần đây.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="4" class="du-empty-state">Tuyệt vời! Không có câu lệnh SQL nào bị ngắt gần đây.</td></tr>';
           } else {
             tbody.innerHTML = top.map(function (q) {
               const reason = q.type === 'mysql_high_memory'
@@ -247,13 +730,33 @@ cat <<'DARL_USER_HTML'
             }).join('');
           }
         } catch (err) {
-          document.getElementById('du-acct-meta').textContent = 'Lỗi tải dữ liệu: ' + err.message;
+          const metaEl = document.getElementById('du-acct-meta');
+          if (metaEl) metaEl.textContent = 'Lỗi tải dữ liệu: ' + err.message;
         }
       }
 
       document.getElementById('du-refresh').addEventListener('click', refreshStats);
       refreshStats();
-      setInterval(refreshStats, 5000);
+
+      const pollTimer = setInterval(function () {
+        if (!document.getElementById(ROOT_ID)) {
+          clearInterval(pollTimer);
+          restoreContainerStyles();
+          return;
+        }
+        refreshStats();
+      }, 5000);
+
+      if (typeof MutationObserver === 'function' && document.body) {
+        const obs = new MutationObserver(function () {
+          if (!document.getElementById(ROOT_ID)) {
+            clearInterval(pollTimer);
+            restoreContainerStyles();
+            obs.disconnect();
+          }
+        });
+        obs.observe(document.body, { childList: true, subtree: true });
+      }
     })();
   </script>
 </div>

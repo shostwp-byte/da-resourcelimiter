@@ -207,14 +207,16 @@ install_from_bundle() {
         fi
     done
 
-    # Sync latest Evolution Skin Monitor SVG icons if release bundle predates plugin/images/
-    if [[ ! -f "${PLUGIN_DEST}/images/admin_icon.svg" ]]; then
+    # Sync latest Evolution Skin Monitor SVG icons & Widescreen UI if release bundle predates them
+    if [[ ! -f "${bundle_dir}/plugin/images/admin_icon.svg" ]]; then
         local raw_auth=()
         [[ -n "$GITHUB_TOKEN" ]] && raw_auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
         curl -fsSL "${raw_auth[@]}" "https://raw.githubusercontent.com/${GITHUB_REPO}/main/plugin/images/admin_icon.svg" -o "${PLUGIN_DEST}/images/admin_icon.svg" 2>/dev/null || true
         curl -fsSL "${raw_auth[@]}" "https://raw.githubusercontent.com/${GITHUB_REPO}/main/plugin/images/user_icon.svg" -o "${PLUGIN_DEST}/images/user_icon.svg" 2>/dev/null || true
         curl -fsSL "${raw_auth[@]}" "https://raw.githubusercontent.com/${GITHUB_REPO}/main/plugin/hooks/admin_img.html" -o "${PLUGIN_DEST}/hooks/admin_img.html" 2>/dev/null || true
         curl -fsSL "${raw_auth[@]}" "https://raw.githubusercontent.com/${GITHUB_REPO}/main/plugin/hooks/user_img.html" -o "${PLUGIN_DEST}/hooks/user_img.html" 2>/dev/null || true
+        curl -fsSL "${raw_auth[@]}" "https://raw.githubusercontent.com/${GITHUB_REPO}/main/plugin/admin/index.html" -o "${PLUGIN_DEST}/admin/index.html" 2>/dev/null || true
+        curl -fsSL "${raw_auth[@]}" "https://raw.githubusercontent.com/${GITHUB_REPO}/main/plugin/user/index.html" -o "${PLUGIN_DEST}/user/index.html" 2>/dev/null || true
     fi
     cp -a "${bundle_dir}/plugin/plugin.conf" "${PLUGIN_DEST}/plugin.conf"
     cp -a "${bundle_dir}/plugin/data/default.conf.example" "${PLUGIN_DEST}/data/default.conf.example"

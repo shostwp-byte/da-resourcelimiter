@@ -2,139 +2,387 @@
 cat <<'DARL_ADMIN_HTML'
 <div id="darl-root">
   <style>
+    :where(div, section, article, main):has(#darl-root) {
+      max-width: 100% !important;
+    }
     #darl-root {
-      --bg: #f8fafc;
+      --bg-top: #f8fafc;
+      --bg-bot: #f1f5f9;
       --card: #ffffff;
       --border: #e2e8f0;
+      --border-strong: #cbd5e1;
       --text: #0f172a;
+      --text-soft: #334155;
       --muted: #64748b;
       --primary: #0284c7;
       --primary-hover: #0369a1;
       --success: #16a34a;
       --warn: #d97706;
       --danger: #dc2626;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
       color: var(--text);
-      background: var(--bg);
-      padding: 18px;
-      border-radius: 10px;
+      background: linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bot) 100%);
+      border: 1px solid var(--border);
+      padding: 24px 28px;
+      border-radius: 14px;
+      width: 100%;
+      max-width: 1680px;
+      margin: 0 auto;
       box-sizing: border-box;
+      box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
     }
     #darl-root * { box-sizing: border-box; }
-    .darl-header {
-      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
-      gap: 12px; margin-bottom: 16px; padding-bottom: 14px; border-bottom: 1px solid var(--border);
+    @media (max-width: 768px) {
+      #darl-root { padding: 16px; border-radius: 10px; }
     }
-    .darl-title { display: flex; align-items: center; gap: 10px; margin: 0; font-size: 20px; font-weight: 700; }
+
+    .darl-header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 18px;
+      padding: 18px 22px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
+    }
+    .darl-brand {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      min-width: 0;
+    }
+    .darl-icon-box {
+      width: 46px;
+      height: 46px;
+      border-radius: 11px;
+      background: linear-gradient(135deg, #f0f9ff 0%, #dcfce7 100%);
+      border: 1px solid #bae6fd;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    .darl-title {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+      margin: 0;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.015em;
+    }
+    .darl-header-ctrl {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+    .darl-autorefresh-pill {
+      font-size: 12.5px;
+      font-weight: 600;
+      color: var(--text-soft);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      padding: 7px 12px;
+      border-radius: 8px;
+      background: #f8fafc;
+      border: 1px solid var(--border);
+    }
+
     .darl-badge {
-      display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
-      border-radius: 999px; font-size: 12px; font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      white-space: nowrap;
     }
     .darl-badge-ok { background: #dcfce7; color: #166534; }
     .darl-badge-err { background: #fee2e2; color: #991b1b; }
     .darl-badge-warn { background: #fef3c7; color: #92400e; }
     .darl-badge-info { background: #e0f2fe; color: #075985; }
+
     .darl-tabs {
-      display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 18px;
-      border-bottom: 1px solid var(--border); padding-bottom: 8px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 20px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      padding: 6px;
+      border-radius: 11px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.02);
     }
     .darl-tab {
-      border: 1px solid transparent; background: transparent; color: var(--muted);
-      padding: 8px 14px; border-radius: 7px; font-size: 13.5px; font-weight: 600; cursor: pointer;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      padding: 9px 16px;
+      border-radius: 8px;
+      font-size: 13.5px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s ease;
     }
     .darl-tab:hover { background: #f1f5f9; color: var(--text); }
-    .darl-tab.active { background: var(--primary); color: #fff; }
+    .darl-tab.active {
+      background: var(--primary);
+      color: #ffffff;
+      box-shadow: 0 1px 3px rgba(2, 132, 199, 0.28);
+    }
+
     .darl-panel { display: none; }
     .darl-panel.active { display: block; }
+
     .darl-kpis {
-      display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-      gap: 12px; margin-bottom: 16px;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 16px;
+      margin-bottom: 18px;
     }
+    @media (max-width: 1150px) {
+      .darl-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 600px) {
+      .darl-kpis { grid-template-columns: 1fr; }
+    }
+
     .darl-card {
-      background: var(--card); border: 1px solid var(--border);
-      border-radius: 9px; padding: 15px; margin-bottom: 14px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 18px 20px;
+      margin-bottom: 18px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
     }
-    .darl-kpi-label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
-    .darl-kpi-val { font-size: 22px; font-weight: 700; margin-top: 4px; }
-    .darl-toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }
+    .darl-kpis > .darl-card {
+      margin-bottom: 0;
+      border-top: 3px solid var(--primary);
+    }
+    .darl-kpis > .darl-card:nth-child(2) { border-top-color: #0ea5e9; }
+    .darl-kpis > .darl-card:nth-child(3) { border-top-color: #7c3aed; }
+    .darl-kpis > .darl-card:nth-child(4) { border-top-color: #f59e0b; }
+
+    .darl-kpi-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .darl-kpi-val {
+      font-size: 24px;
+      font-weight: 700;
+      margin-top: 6px;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+    }
+
+    .darl-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 14px;
+    }
     .darl-input, .darl-select {
-      padding: 7px 11px; border: 1px solid #cbd5e1; border-radius: 6px;
-      font-size: 13px; background: #fff; color: var(--text);
+      padding: 8px 12px;
+      border: 1px solid var(--border-strong);
+      border-radius: 8px;
+      font-size: 13px;
+      background: #ffffff;
+      color: var(--text);
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
     }
+    .darl-input:focus, .darl-select:focus {
+      outline: none;
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(2, 132, 199, 0.12);
+    }
+
     .darl-btn {
-      padding: 7px 13px; border-radius: 6px; border: 1px solid transparent;
-      font-size: 13px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+      padding: 8px 14px;
+      border-radius: 8px;
+      border: 1px solid transparent;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s ease;
     }
     .darl-btn:disabled { opacity: 0.55; cursor: not-allowed; }
-    .darl-btn-primary { background: var(--primary); color: #fff; }
+    .darl-btn-primary { background: var(--primary); color: #ffffff; }
     .darl-btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
-    .darl-btn-outline { background: #fff; border-color: #cbd5e1; color: var(--text); }
-    .darl-btn-outline:hover:not(:disabled) { background: #f1f5f9; }
-    .darl-btn-danger { background: var(--danger); color: #fff; }
-    .darl-btn-warn { background: var(--warn); color: #fff; }
-    .darl-table-wrap { overflow-x: auto; }
-    table.darl-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .darl-btn-outline { background: #ffffff; border-color: var(--border-strong); color: var(--text); }
+    .darl-btn-outline:hover:not(:disabled) { background: #f8fafc; border-color: #94a3b8; }
+    .darl-btn-danger { background: var(--danger); color: #ffffff; }
+    .darl-btn-warn { background: var(--warn); color: #ffffff; }
+
+    .darl-table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    table.darl-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
     table.darl-table th, table.darl-table td {
-      padding: 9px 10px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: middle;
+      padding: 11px 14px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
     }
-    table.darl-table th { background: #f8fafc; color: var(--muted); font-weight: 600; white-space: nowrap; }
+    table.darl-table tr:last-child td { border-bottom: none; }
+    table.darl-table th {
+      background: #f8fafc;
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      white-space: nowrap;
+    }
+    table.darl-table tbody tr:hover { background: #f8fafc; }
+
     .darl-prog {
-      width: 110px; height: 7px; background: #e2e8f0; border-radius: 999px; overflow: hidden; margin-top: 4px;
+      width: 100%;
+      min-width: 130px;
+      max-width: 210px;
+      height: 8px;
+      background: #e2e8f0;
+      border-radius: 999px;
+      overflow: hidden;
+      margin-top: 5px;
     }
-    .darl-prog > span { display: block; height: 100%; border-radius: 999px; background: var(--primary); }
-    .darl-prog > span.warn { background: var(--warn); }
-    .darl-prog > span.crit { background: var(--danger); }
+    .darl-prog > span {
+      display: block;
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, #0ea5e9 0%, #0284c7 100%);
+      transition: width 0.25s ease;
+    }
+    .darl-prog > span.warn { background: linear-gradient(90deg, #f59e0b 0%, #d97706 100%); }
+    .darl-prog > span.crit { background: linear-gradient(90deg, #ef4444 0%, #dc2626 100%); }
+
     .darl-grid-form {
-      display: grid; grid-template-columns: repeat(auto-fit, minmax(195px, 1fr)); gap: 12px;
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(235px, 1fr));
+      gap: 14px 16px;
     }
-    .darl-field label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 4px; }
+    .darl-field label {
+      display: block;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+      margin-bottom: 5px;
+    }
     .darl-field input, .darl-field select { width: 100%; }
+
     .darl-mono {
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 12px; background: #f1f5f9; padding: 4px 7px; border-radius: 5px; word-break: break-all;
+      font-size: 12px;
+      background: #f1f5f9;
+      border: 1px solid #e2e8f0;
+      padding: 5px 8px;
+      border-radius: 6px;
+      word-break: break-all;
+      color: #1e293b;
     }
     .darl-toast {
-      display: none; padding: 10px 14px; border-radius: 7px; margin-bottom: 14px; font-size: 13px; font-weight: 600;
+      display: none;
+      padding: 12px 16px;
+      border-radius: 10px;
+      margin-bottom: 16px;
+      font-size: 13.5px;
+      font-weight: 600;
     }
     .darl-toast.ok { display: block; background: #dcfce7; color: #166534; border: 1px solid #86efac; }
     .darl-toast.err { display: block; background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; }
-    .darl-split { display: grid; grid-template-columns: 300px 1fr; gap: 14px; }
-    @media (max-width: 900px) { .darl-split { grid-template-columns: 1fr; } }
-    .darl-user-list { max-height: 520px; overflow-y: auto; border: 1px solid var(--border); border-radius: 7px; }
-    .darl-user-item {
-      padding: 9px 12px; border-bottom: 1px solid var(--border); cursor: pointer;
-      display: flex; justify-content: space-between; align-items: center; font-size: 13px;
+
+    .darl-split {
+      display: grid;
+      grid-template-columns: 340px minmax(0, 1fr);
+      gap: 18px;
+      align-items: start;
     }
-    .darl-user-item:hover { background: #f1f5f9; }
-    .darl-user-item.selected { background: #e0f2fe; font-weight: 700; }
+    @media (max-width: 960px) { .darl-split { grid-template-columns: 1fr; } }
+
+    .darl-user-list {
+      max-height: 560px;
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      background: #ffffff;
+    }
+    .darl-user-item {
+      padding: 10px 13px;
+      border-bottom: 1px solid var(--border);
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 13px;
+      transition: background 0.12s ease;
+    }
+    .darl-user-item:last-child { border-bottom: none; }
+    .darl-user-item:hover { background: #f8fafc; }
+    .darl-user-item.selected { background: #e0f2fe; font-weight: 700; color: #0369a1; }
+
     .darl-pre {
-      background: #0f172a; color: #e2e8f0; padding: 12px; border-radius: 7px;
-      font-size: 12px; max-height: 240px; overflow-y: auto; white-space: pre-wrap;
+      background: #0f172a;
+      color: #e2e8f0;
+      padding: 14px 16px;
+      border-radius: 9px;
+      font-size: 12.5px;
+      max-height: 280px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      line-height: 1.5;
     }
   </style>
 
   <div class="darl-header">
-    <div>
-      <h2 class="darl-title">
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="28" height="28" fill="none" style="flex-shrink:0;">
+    <div class="darl-brand">
+      <div class="darl-icon-box">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="28" height="28" fill="none">
           <path d="M26 44L24 54M38 44L40 54" stroke="#0284C7" stroke-width="4" stroke-linecap="round"/>
           <path d="M18 54H46" stroke="#0284C7" stroke-width="4.5" stroke-linecap="round"/>
           <rect x="6" y="8" width="52" height="36" rx="6" fill="#0F172A" stroke="#0EA5E9" stroke-width="3.8"/>
           <path d="M13 27H20L25 17L31 34L36.5 22L40.5 27H50" stroke="#22C55E" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
           <circle cx="50" cy="27" r="3.2" fill="#22C55E"/>
         </svg>
-        <span>DA Resource Limiter</span>
-        <span id="darl-daemon-badge" class="darl-badge darl-badge-info">Đang kết nối...</span>
-      </h2>
-      <div id="darl-daemon-meta" style="font-size:12px;color:var(--muted);margin-top:4px;">
-        Cgroups v2 + PHP-FPM/LSPHP Scope + MariaDB 3-Tier Governor
+      </div>
+      <div>
+        <h2 class="darl-title">
+          <span>DA Resource Limiter</span>
+          <span id="darl-daemon-badge" class="darl-badge darl-badge-info">Đang kết nối...</span>
+        </h2>
+        <div id="darl-daemon-meta" style="font-size:12.5px;color:var(--muted);margin-top:4px;">
+          Cgroups v2 + PHP-FPM/LSPHP Scope + MariaDB 3-Tier Governor
+        </div>
       </div>
     </div>
-    <div style="display:flex;gap:8px;align-items:center;">
-      <label style="font-size:12.5px;color:var(--muted);display:flex;align-items:center;gap:5px;cursor:pointer;">
+    <div class="darl-header-ctrl">
+      <label class="darl-autorefresh-pill">
         <input type="checkbox" id="darl-autorefresh" checked /> Tự làm mới (5s)
       </label>
-      <button type="button" class="darl-btn darl-btn-outline" id="darl-btn-refresh">Làm mới ngay</button>
+      <button type="button" class="darl-btn darl-btn-outline" id="darl-btn-refresh">
+        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
+        <span>Làm mới ngay</span>
+      </button>
     </div>
   </div>
 
@@ -159,7 +407,7 @@ cat <<'DARL_ADMIN_HTML'
 
     <div class="darl-card">
       <div class="darl-toolbar">
-        <input type="text" id="mon-search" class="darl-input" placeholder="Tìm theo Username hoặc Package..." style="min-width:240px;" />
+        <input type="text" id="mon-search" class="darl-input" placeholder="Tìm theo Username hoặc Package..." style="min-width:280px;flex:1;max-width:420px;" />
         <select id="mon-sort" class="darl-select">
           <option value="cpu">Sắp xếp: CPU cao nhất</option>
           <option value="ram">Sắp xếp: Physical RAM cao nhất</option>
@@ -182,7 +430,7 @@ cat <<'DARL_ADMIN_HTML'
             </tr>
           </thead>
           <tbody id="mon-tbody">
-            <tr><td colspan="8" style="text-align:center;color:var(--muted);">Đang tải dữ liệu thời gian thực...</td></tr>
+            <tr><td colspan="8" style="text-align:center;color:var(--muted);padding:24px;">Đang tải dữ liệu thời gian thực...</td></tr>
           </tbody>
         </table>
       </div>
@@ -192,7 +440,7 @@ cat <<'DARL_ADMIN_HTML'
   <!-- TAB 2: PACKAGE LIMITS -->
   <div id="darl-panel-packages" class="darl-panel">
     <div class="darl-card">
-      <h3 style="margin:0 0 12px 0;font-size:15px;">Danh sách Hosting Packages trên DirectAdmin</h3>
+      <h3 style="margin:0 0 14px 0;font-size:15.5px;">Danh sách Hosting Packages trên DirectAdmin</h3>
       <div class="darl-table-wrap">
         <table class="darl-table">
           <thead>
@@ -208,17 +456,17 @@ cat <<'DARL_ADMIN_HTML'
             </tr>
           </thead>
           <tbody id="pkg-tbody">
-            <tr><td colspan="8" style="text-align:center;color:var(--muted);">Đang tải danh sách Package...</td></tr>
+            <tr><td colspan="8" style="text-align:center;color:var(--muted);padding:24px;">Đang tải danh sách Package...</td></tr>
           </tbody>
         </table>
       </div>
     </div>
 
     <div class="darl-card">
-      <h3 id="pkg-form-title" style="margin:0 0 12px 0;font-size:15px;">Chỉnh sửa Cấu hình Mặc định (default.conf)</h3>
+      <h3 id="pkg-form-title" style="margin:0 0 14px 0;font-size:15.5px;">Chỉnh sửa Cấu hình Mặc định (default.conf)</h3>
       <input type="hidden" id="pkg-edit-target" value="__default__" />
       <div id="pkg-fields-container" class="darl-grid-form"></div>
-      <div style="margin-top:14px;display:flex;flex-wrap:wrap;gap:10px;">
+      <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border);display:flex;flex-wrap:wrap;gap:10px;">
         <button type="button" class="darl-btn darl-btn-primary" id="btn-pkg-save-sync">Save &amp; Sync All Users</button>
         <button type="button" class="darl-btn darl-btn-outline" id="btn-pkg-save-only">Chỉ lưu cấu hình</button>
         <button type="button" class="darl-btn darl-btn-outline" id="btn-pkg-edit-default">Chọn lại default.conf</button>
@@ -230,8 +478,8 @@ cat <<'DARL_ADMIN_HTML'
   <div id="darl-panel-users" class="darl-panel">
     <div class="darl-split">
       <div class="darl-card" style="margin-bottom:0;">
-        <input type="text" id="usr-search" class="darl-input" placeholder="Tìm nhanh User..." style="width:100%;margin-bottom:8px;" />
-        <select id="usr-filter" class="darl-select" style="width:100%;margin-bottom:10px;">
+        <input type="text" id="usr-search" class="darl-input" placeholder="Tìm nhanh User..." style="width:100%;margin-bottom:10px;" />
+        <select id="usr-filter" class="darl-select" style="width:100%;margin-bottom:12px;">
           <option value="all">Tất cả Hosting Users</option>
           <option value="override">Đang bật Custom Override</option>
           <option value="penalty">Đang trong Penalty Box</option>
@@ -240,14 +488,14 @@ cat <<'DARL_ADMIN_HTML'
       </div>
 
       <div class="darl-card" style="margin-bottom:0;">
-        <div id="usr-empty-hint" style="color:var(--muted);padding:24px 0;text-align:center;">
+        <div id="usr-empty-hint" style="color:var(--muted);padding:42px 16px;text-align:center;font-size:13.5px;">
           Chọn một tài khoản bên trái để xem thông số thực tế và thiết lập giới hạn riêng (Custom Override).
         </div>
         <div id="usr-editor-wrap" style="display:none;">
-          <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;margin-bottom:12px;">
+          <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:10px;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border);">
             <div>
-              <h3 id="usr-edit-heading" style="margin:0;font-size:16px;">User</h3>
-              <div id="usr-edit-sub" style="font-size:12px;color:var(--muted);margin-top:3px;"></div>
+              <h3 id="usr-edit-heading" style="margin:0;font-size:16.5px;">User</h3>
+              <div id="usr-edit-sub" style="font-size:12.5px;color:var(--muted);margin-top:4px;"></div>
             </div>
             <div style="display:flex;gap:8px;">
               <button type="button" class="darl-btn darl-btn-warn" id="btn-usr-unblock" style="display:none;">Unblock Penalty</button>
@@ -255,7 +503,7 @@ cat <<'DARL_ADMIN_HTML'
             </div>
           </div>
           <div id="usr-fields-container" class="darl-grid-form"></div>
-          <div style="margin-top:14px;display:flex;gap:10px;">
+          <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border);display:flex;flex-wrap:wrap;gap:10px;">
             <button type="button" class="darl-btn darl-btn-primary" id="btn-usr-save">Lưu Custom Override &amp; Áp dụng ngay</button>
             <button type="button" class="darl-btn darl-btn-outline" id="btn-usr-reapply">Đồng bộ lại xuống OS/MySQL</button>
           </div>
@@ -268,7 +516,7 @@ cat <<'DARL_ADMIN_HTML'
   <div id="darl-panel-logs" class="darl-panel">
     <div class="darl-card">
       <div class="darl-toolbar">
-        <input type="text" id="log-user" class="darl-input" placeholder="Lọc theo Username..." />
+        <input type="text" id="log-user" class="darl-input" placeholder="Lọc theo Username..." style="min-width:220px;" />
         <select id="log-type" class="darl-select">
           <option value="">Tất cả loại vi phạm</option>
           <option value="cgroup_oom_kill">Kernel OOM Killed (Cgroups v2)</option>
@@ -295,7 +543,7 @@ cat <<'DARL_ADMIN_HTML'
             </tr>
           </thead>
           <tbody id="log-tbody">
-            <tr><td colspan="5" style="text-align:center;color:var(--muted);">Chưa tải dữ liệu nhật ký.</td></tr>
+            <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:24px;">Chưa tải dữ liệu nhật ký.</td></tr>
           </tbody>
         </table>
       </div>
@@ -312,20 +560,20 @@ cat <<'DARL_ADMIN_HTML'
     </div>
 
     <div class="darl-card">
-      <h3 style="margin:0 0 12px 0;font-size:15px;">Kiểm tra &amp; Cập nhật Một chạm từ GitHub Releases</h3>
+      <h3 style="margin:0 0 12px 0;font-size:15.5px;">Kiểm tra &amp; Cập nhật Một chạm từ GitHub Releases</h3>
       <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:12px;">
         <button type="button" class="darl-btn darl-btn-outline" id="btn-upd-check">Check for Updates</button>
         <button type="button" class="darl-btn darl-btn-primary" id="btn-upd-trigger">One-Click Update Now</button>
         <button type="button" class="darl-btn darl-btn-danger" id="btn-upd-rollback">Rollback Snapshot Trước</button>
       </div>
       <div id="upd-notes-wrap" style="display:none;">
-        <div style="font-size:12px;font-weight:600;color:var(--muted);margin-bottom:5px;">Release Notes / Thông tin tiến trình:</div>
+        <div style="font-size:12px;font-weight:600;color:var(--muted);margin-bottom:6px;">Release Notes / Thông tin tiến trình:</div>
         <pre id="upd-notes" class="darl-pre"></pre>
       </div>
     </div>
 
     <div class="darl-card">
-      <h3 style="margin:0 0 12px 0;font-size:15px;">Cấu hình GitHub Repository (Hỗ trợ cả Public &amp; Private Repo)</h3>
+      <h3 style="margin:0 0 14px 0;font-size:15.5px;">Cấu hình GitHub Repository (Hỗ trợ cả Public &amp; Private Repo)</h3>
       <div class="darl-grid-form">
         <div class="darl-field">
           <label>GitHub Repository (owner/repo)</label>
@@ -347,13 +595,13 @@ cat <<'DARL_ADMIN_HTML'
           <input type="number" id="upd-retention" class="darl-input" min="1" max="30" value="5" />
         </div>
       </div>
-      <div style="margin-top:10px;">
+      <div style="margin-top:12px;">
         <label style="font-size:12.5px;color:var(--muted);display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
           <input type="checkbox" id="upd-keep-token" checked />
           Giữ nguyên GitHub Token đang lưu trong <code class="darl-mono">/etc/da-resourced/updater.conf</code> (bỏ tích nếu muốn ghi đè/xoá Token)
         </label>
       </div>
-      <div style="margin-top:12px;">
+      <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border);">
         <button type="button" class="darl-btn darl-btn-primary" id="btn-upd-save">Lưu cấu hình GitHub Updater</button>
       </div>
     </div>
@@ -361,11 +609,110 @@ cat <<'DARL_ADMIN_HTML'
 
   <script>
     (function () {
+      const ROOT_ID = 'darl-root';
       const API_URL = '/CMD_PLUGINS_ADMIN/da_resource_limiter/api.raw';
       let cachedUsers = [];
       let cachedPackages = null;
       let selectedUsername = '';
       let activeTab = 'monitor';
+      const modifiedNodes = new Map();
+
+      function rememberAndSetStyle(el, prop, val) {
+        if (!modifiedNodes.has(el)) {
+          modifiedNodes.set(el, el.getAttribute('style'));
+        }
+        el.style.setProperty(prop, val, 'important');
+      }
+
+      function restoreContainerStyles() {
+        modifiedNodes.forEach(function (origStyle, el) {
+          try {
+            if (!el) return;
+            if (origStyle === null) el.removeAttribute('style');
+            else el.setAttribute('style', origStyle);
+          } catch (_) {}
+        });
+        modifiedNodes.clear();
+      }
+
+      function hasHorizontalSibling(el) {
+        const p = el.parentElement;
+        if (!p) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return false;
+        const win = el.ownerDocument.defaultView || window;
+        for (let i = 0; i < p.children.length; i++) {
+          const sib = p.children[i];
+          if (sib === el) continue;
+          const tag = sib.tagName;
+          if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LINK') continue;
+          const cs = win.getComputedStyle(sib);
+          if (cs.display === 'none' || cs.visibility === 'hidden' || cs.position === 'fixed' || cs.position === 'absolute') continue;
+          const sr = sib.getBoundingClientRect();
+          if (sr.width < 24 || sr.height < 24 || sr.right <= 0 || sr.bottom <= 0) continue;
+          const vOverlap = Math.min(r.bottom, sr.bottom) - Math.max(r.top, sr.top);
+          if (vOverlap > 24 && (sr.right <= r.left + 12 || sr.left >= r.right - 12)) {
+            return true;
+          }
+        }
+        return false;
+      }
+
+      function widenChainFrom(startEl) {
+        if (!startEl) return;
+        const doc = startEl.ownerDocument;
+        const win = doc.defaultView || window;
+        let el = startEl;
+        let depth = 0;
+        while (el && el !== doc.body && el !== doc.documentElement && depth < 14) {
+          const cs = win.getComputedStyle(el);
+          if (hasHorizontalSibling(el)) {
+            if (cs.maxWidth && cs.maxWidth !== 'none') {
+              rememberAndSetStyle(el, 'max-width', 'none');
+            }
+            rememberAndSetStyle(el, 'min-width', '0');
+            const pcs = el.parentElement ? win.getComputedStyle(el.parentElement) : null;
+            if (pcs && (pcs.display === 'flex' || pcs.display === 'inline-flex')) {
+              rememberAndSetStyle(el, 'flex', '1 1 0%');
+            } else if (pcs && (pcs.display === 'grid' || pcs.display === 'inline-grid')) {
+              rememberAndSetStyle(el, 'width', '100%');
+            }
+            break;
+          }
+          rememberAndSetStyle(el, 'max-width', '100%');
+          rememberAndSetStyle(el, 'width', '100%');
+          if ((cs.display === 'grid' || cs.display === 'inline-grid') && el.children.length === 1) {
+            rememberAndSetStyle(el, 'grid-template-columns', 'minmax(0, 1fr)');
+          }
+          const padL = parseFloat(cs.paddingLeft) || 0;
+          const padR = parseFloat(cs.paddingRight) || 0;
+          if (padL > 48 && padR > 48) {
+            rememberAndSetStyle(el, 'padding-left', '24px');
+            rememberAndSetStyle(el, 'padding-right', '24px');
+          }
+          el = el.parentElement;
+          depth++;
+        }
+      }
+
+      function expandEvolutionContainer() {
+        const root = document.getElementById(ROOT_ID);
+        if (!root) return;
+        if (root.parentElement) {
+          widenChainFrom(root.parentElement);
+        }
+        try {
+          if (window.frameElement && window.parent && window.parent !== window && window.parent.document) {
+            widenChainFrom(window.frameElement);
+          }
+        } catch (_) {}
+      }
+
+      expandEvolutionContainer();
+      if (typeof window.requestAnimationFrame === 'function') {
+        window.requestAnimationFrame(expandEvolutionContainer);
+      }
+      setTimeout(expandEvolutionContainer, 150);
 
       const LIMIT_FIELDS = [
         { key: 'enabled', label: 'Kích hoạt giới hạn', type: 'bool' },
@@ -470,6 +817,7 @@ cat <<'DARL_ADMIN_HTML'
       }
 
       async function loadRealtime() {
+        if (!document.getElementById(ROOT_ID)) return;
         try {
           const r = await callAPI({ action: 'get_realtime_stats' }, false);
           const badge = document.getElementById('darl-daemon-badge');
@@ -477,7 +825,7 @@ cat <<'DARL_ADMIN_HTML'
             badge.className = 'darl-badge darl-badge-err';
             badge.textContent = 'DAEMON OFFLINE';
             document.getElementById('mon-tbody').innerHTML =
-              '<tr><td colspan="8" style="color:var(--danger);text-align:center;">' + esc(r.error) + '</td></tr>';
+              '<tr><td colspan="8" style="color:var(--danger);text-align:center;padding:24px;">' + esc(r.error) + '</td></tr>';
             return;
           }
           const d = r.data.daemon;
@@ -526,7 +874,7 @@ cat <<'DARL_ADMIN_HTML'
 
         const tbody = document.getElementById('mon-tbody');
         if (!rows.length) {
-          tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted);">Không có tài khoản Hosting nào khớp bộ lọc.</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:24px;">Không có tài khoản Hosting nào khớp bộ lọc.</td></tr>';
           return;
         }
 
@@ -549,10 +897,10 @@ cat <<'DARL_ADMIN_HTML'
           return '<tr>' +
             '<td><strong>' + esc(u.username) + '</strong> <span style="color:var(--muted);font-size:11.5px;">(#' + u.uid + ')</span></td>' +
             '<td>' + esc(u.package || '-') + '</td>' +
-            '<td>' + (u.cpu_percent || 0).toFixed(1) + '% / ' + (lim.cpu_quota || 0) + '%' + pctBar(u.cpu_percent || 0, lim.cpu_quota || 100) + '</td>' +
-            '<td>' + (u.memory_current_mb || 0).toFixed(1) + ' / ' + (lim.mem_max_mb || 0) + ' MB' + pctBar(u.memory_current_mb || 0, lim.mem_max_mb || 1024) + '</td>' +
+            '<td><strong>' + (u.cpu_percent || 0).toFixed(1) + '%</strong> / ' + (lim.cpu_quota || 0) + '%' + pctBar(u.cpu_percent || 0, lim.cpu_quota || 100) + '</td>' +
+            '<td><strong>' + (u.memory_current_mb || 0).toFixed(1) + '</strong> / ' + (lim.mem_max_mb || 0) + ' MB' + pctBar(u.memory_current_mb || 0, lim.mem_max_mb || 1024) + '</td>' +
             '<td>' + (u.active_processes || 0) + ' / ' + (lim.tasks_max || 0) + '</td>' +
-            '<td>' + (u.mysql_memory_mb || 0).toFixed(1) + ' / ' + (lim.mysql_max_mem_mb || 0) + ' MB<br/><span style="font-size:11.5px;color:var(--muted);">' +
+            '<td><strong>' + (u.mysql_memory_mb || 0).toFixed(1) + '</strong> / ' + (lim.mysql_max_mem_mb || 0) + ' MB<br/><span style="font-size:11.5px;color:var(--muted);">' +
               (u.mysql_total_conns || 0) + ' / ' + (lim.mysql_max_connections || 0) + ' conns (' + (u.mysql_active_queries || 0) + ' active)</span></td>' +
             '<td>' + stateBadge + '</td>' +
             '<td style="white-space:nowrap;">' + actions + '</td>' +
@@ -567,7 +915,7 @@ cat <<'DARL_ADMIN_HTML'
         const tbody = document.getElementById('pkg-tbody');
         const list = cachedPackages.packages || [];
         if (!list.length) {
-          tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted);">Chưa có Hosting Package nào trên DirectAdmin.</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:24px;">Chưa có Hosting Package nào trên DirectAdmin.</td></tr>';
         } else {
           tbody.innerHTML = list.map(function (item) {
             const l = item.limits;
@@ -626,7 +974,7 @@ cat <<'DARL_ADMIN_HTML'
 
         const listEl = document.getElementById('usr-list');
         if (!filtered.length) {
-          listEl.innerHTML = '<div style="padding:14px;color:var(--muted);font-size:12.5px;text-align:center;">Không tìm thấy User phù hợp.</div>';
+          listEl.innerHTML = '<div style="padding:18px;color:var(--muted);font-size:12.5px;text-align:center;">Không tìm thấy User phù hợp.</div>';
           return;
         }
         listEl.innerHTML = filtered.map(function (u) {
@@ -663,12 +1011,12 @@ cat <<'DARL_ADMIN_HTML'
         }, false);
         const tbody = document.getElementById('log-tbody');
         if (!r.ok) {
-          tbody.innerHTML = '<tr><td colspan="5" style="color:var(--danger);text-align:center;">' + esc(r.error) + '</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="5" style="color:var(--danger);text-align:center;padding:24px;">' + esc(r.error) + '</td></tr>';
           return;
         }
         const items = r.data || [];
         if (!items.length) {
-          tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--muted);">Chưa ghi nhận sự kiện vi phạm nào.</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:24px;">Chưa ghi nhận sự kiện vi phạm nào.</td></tr>';
           return;
         }
         tbody.innerHTML = items.map(function (e) {
@@ -727,6 +1075,7 @@ cat <<'DARL_ADMIN_HTML'
         document.querySelectorAll('#darl-root .darl-panel').forEach(function (p) {
           p.classList.toggle('active', p.id === 'darl-panel-' + tab);
         });
+        expandEvolutionContainer();
         if (tab === 'packages') loadPackages();
         else if (tab === 'logs') loadLogs();
         else if (tab === 'updater') loadUpdaterStatus();
@@ -854,11 +1203,29 @@ cat <<'DARL_ADMIN_HTML'
       });
 
       loadRealtime();
-      setInterval(function () {
-        if (document.getElementById('darl-autorefresh').checked && activeTab === 'monitor') {
+      const pollTimer = setInterval(function () {
+        const root = document.getElementById(ROOT_ID);
+        if (!root) {
+          clearInterval(pollTimer);
+          restoreContainerStyles();
+          return;
+        }
+        const autoEl = document.getElementById('darl-autorefresh');
+        if (autoEl && autoEl.checked && activeTab === 'monitor') {
           loadRealtime();
         }
       }, 5000);
+
+      if (typeof MutationObserver === 'function' && document.body) {
+        const obs = new MutationObserver(function () {
+          if (!document.getElementById(ROOT_ID)) {
+            clearInterval(pollTimer);
+            restoreContainerStyles();
+            obs.disconnect();
+          }
+        });
+        obs.observe(document.body, { childList: true, subtree: true });
+      }
     })();
   </script>
 </div>
