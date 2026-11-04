@@ -2,13 +2,20 @@ package ipc
 
 import "github.com/shostwp-byte/da-resourcelimiter/internal/config"
 
-// Supported IPC Socket actions over /var/run/da-resourced.sock.
+// Supported IPC Socket actions over /var/run/da-resourced.sock (Admin) and /var/run/da-resourced-user.sock (User).
 const (
 	ActionPing               = "ping"
 	ActionGetRealtimeStats   = "get_realtime_stats"
 	ActionGetUserStats       = "get_user_stats"
+	ActionGetPackages        = "get_packages"
+	ActionSaveDefaultLimits  = "save_default_limits"
+	ActionSavePackageLimits  = "save_package_limits"
+	ActionSaveUserLimits     = "save_user_limits"
+	ActionResetUserLimits    = "reset_user_limits"
 	ActionApplyUserLimits    = "apply_user_limits"
 	ActionApplyPackageLimits = "apply_package_limits"
+	ActionApplyDBUser        = "apply_db_user"
+	ActionRemoveUser         = "remove_user"
 	ActionUnblockPenalty     = "unblock_penalty"
 	ActionGetLogs            = "get_logs"
 	ActionGetUpdaterStatus   = "get_updater_status"
@@ -18,13 +25,22 @@ const (
 	ActionRollbackUpdate     = "rollback_update"
 )
 
-// Request is the JSON command envelope sent by DirectAdmin CGI/Hooks to da-resourced.
+// Default socket paths on DirectAdmin Linux hosts.
+const (
+	DefaultAdminSocketPath = "/var/run/da-resourced.sock"
+	DefaultUserSocketPath  = "/var/run/da-resourced-user.sock"
+)
+
+// Request is the JSON command envelope sent by DirectAdmin CGI/Hooks/CLI to da-resourced.
 type Request struct {
-	Action        string `json:"action"`
-	Username      string `json:"username,omitempty"`
-	Package       string `json:"package,omitempty"`
-	Limit         int    `json:"limit,omitempty"`
-	ViolationType string `json:"violation_type,omitempty"`
+	Action        string                 `json:"action"`
+	Username      string                 `json:"username,omitempty"`
+	Package       string                 `json:"package,omitempty"`
+	DBUser        string                 `json:"db_user,omitempty"`
+	SyncUsers     bool                   `json:"sync_users,omitempty"`
+	Limits        *config.ResourceLimits `json:"limits,omitempty"`
+	Limit         int                    `json:"limit,omitempty"`
+	ViolationType string                 `json:"violation_type,omitempty"`
 
 	// GitHub Updater fields (Admin Level only)
 	TargetVersion   string `json:"target_version,omitempty"`
@@ -45,28 +61,59 @@ type Response struct {
 
 // PingData reports daemon health and build metadata.
 type PingData struct {
-	Version       string `json:"version"`
-	Commit        string `json:"commit"`
-	BuildTime     string `json:"build_time"`
-	UptimeSeconds int64  `json:"uptime_seconds"`
-	ManagedUsers  int    `json:"managed_users"`
+	Version         string `json:"version"`
+	Commit          string `json:"commit"`
+	BuildTime       string `json:"build_time"`
+	UptimeSeconds   int64  `json:"uptime_seconds"`
+	ManagedUsers    int    `json:"managed_users"`
+	ActivePenalties int    `json:"active_penalties"`
 }
 
 // UserUsageSnapshot combines real-time Cgroups v2 and MariaDB resource usage for a single DirectAdmin user.
 type UserUsageSnapshot struct {
-	Username          string                `json:"username"`
-	UID               uint32                `json:"uid"`
-	Package           string                `json:"package,omitempty"`
-	CPUPercent        float64               `json:"cpu_percent"`
-	MemoryCurrentMB   float64               `json:"memory_current_mb"`
-	ActiveProcesses   int                   `json:"active_processes"`
-	MemoryHighEvents  uint64                `json:"memory_high_events"`
-	OOMKillEvents     uint64                `json:"oom_kill_events"`
-	MySQLMemoryMB     float64               `json:"mysql_memory_mb"`
-	MySQLActiveConns  int                   `json:"mysql_active_conns"`
-	PenaltyActive     bool                  `json:"penalty_active"`
-	PenaltyExpiresUnix int64                `json:"penalty_expires_unix,omitempty"`
-	Limits            config.ResourceLimits `json:"limits"`
+	Username           string                `json:"username"`
+	UID                uint32                `json:"uid"`
+	Package            string                `json:"package,omitempty"`
+	CPUPercent         float64               `json:"cpu_percent"`
+	MemoryCurrentMB    float64               `json:"memory_current_mb"`
+	ActiveProcesses    int                   `json:"active_processes"`
+	MemoryHighEvents   uint64                `json:"memory_high_events"`
+	OOMKillEvents      uint64                `json:"oom_kill_events"`
+	MySQLMemoryMB      float64               `json:"mysql_memory_mb"`
+	MySQLActiveQueries int                   `json:"mysql_active_queries"`
+	MySQLTotalConns    int                   `json:"mysql_total_conns"`
+	OOMKills24h        int                   `json:"oom_kills_24h"`
+	MySQLKills24h      int                   `json:"mysql_kills_24h"`
+	PenaltyActive      bool                  `json:"penalty_active"`
+	PenaltyExpiresUnix int64                 `json:"penalty_expires_unix,omitempty"`
+	PenaltyReason      string                `json:"penalty_reason,omitempty"`
+	Limits             config.ResourceLimits `json:"limits"`
+}
+
+// RealtimeDashboardData is returned to Admin Tab 1 (Realtime Monitor).
+type RealtimeDashboardData struct {
+	Daemon PingData            `json:"daemon"`
+	Users  []UserUsageSnapshot `json:"users"`
+}
+
+// UserPortalData is returned to the User Level Plugin UI (/CMD_PLUGINS/da_resource_limiter).
+type UserPortalData struct {
+	Snapshot         UserUsageSnapshot `json:"snapshot"`
+	TopKilledQueries []ViolationEntry  `json:"top_killed_queries"`
+}
+
+// PackageConfigItem pairs a DirectAdmin package name with its effective ResourceLimits.
+type PackageConfigItem struct {
+	Package       string                `json:"package"`
+	HasCustomFile bool                  `json:"has_custom_file"`
+	UserCount     int                   `json:"user_count"`
+	Limits        config.ResourceLimits `json:"limits"`
+}
+
+// PackagesData is returned to Admin Tab 2 (Package Limits).
+type PackagesData struct {
+	DefaultLimits config.ResourceLimits `json:"default_limits"`
+	Packages      []PackageConfigItem   `json:"packages"`
 }
 
 // ViolationEntry represents an OOM Kill, MySQL Killed Query, or Penalty Box trigger event.
