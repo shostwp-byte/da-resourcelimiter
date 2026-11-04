@@ -1,9 +1,27 @@
 #!/bin/sh
 cat <<'DARL_ADMIN_HTML'
 <div id="darl-root">
+  <script>if (window.self !== window.top) document.documentElement.classList.add('darl-iframe');</script>
   <style>
-    :where(div, section, article, main):has(#darl-root) {
-      max-width: 100% !important;
+    html.darl-iframe,
+    html.darl-iframe body {
+      margin: 0 !important;
+      padding: 0 !important;
+      width: 100% !important;
+      max-width: none !important;
+    }
+    :where(td, div, section, article, main, [role="main"]):has(#darl-root) {
+      max-width: none !important;
+    }
+    :where(main, [role="main"]):has(#darl-root):not(:has(:is(header, nav, aside))) {
+      padding: 0 !important;
+    }
+    :where(main, [role="main"], #content) :where(div, section, article):has(#darl-root),
+    html.darl-iframe :where(div, section, article, main):has(#darl-root) {
+      width: 100% !important;
+      max-width: none !important;
+      margin: 0 !important;
+      padding: 0 !important;
     }
     #darl-root {
       --bg-top: #f8fafc;
@@ -26,8 +44,8 @@ cat <<'DARL_ADMIN_HTML'
       padding: 24px 28px;
       border-radius: 14px;
       width: 100%;
-      max-width: 1680px;
-      margin: 0 auto;
+      max-width: none;
+      margin: 0;
       box-sizing: border-box;
       box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
     }
