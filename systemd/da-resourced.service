@@ -1,0 +1,22 @@
+[Unit]
+Description=DirectAdmin Multi-Tier Resource Limiter Daemon (da-resourced)
+Documentation=https://github.com/shostwp-byte/da-resourcelimiter
+After=network.target mariadb.service mysqld.service directadmin.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/sbin/da-resourced serve
+Restart=always
+RestartSec=2s
+# Protect root resource governor from host OOM Killer
+OOMScoreAdjust=-900
+LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=da-resourced
+
+[Install]
+WantedBy=multi-user.target

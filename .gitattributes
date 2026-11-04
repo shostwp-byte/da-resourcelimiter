@@ -1,0 +1,21 @@
+# Enforce LF line endings for all Linux server files regardless of developer OS (Windows/macOS/Linux)
+* text=auto eol=lf
+
+*.go text eol=lf
+*.mod text eol=lf
+*.sum text eol=lf
+*.sh text eol=lf
+*.raw text eol=lf
+*.php text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.js text eol=lf
+*.conf text eol=lf
+*.example text eol=lf
+*.custom text eol=lf
+*.service text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+Makefile text eol=lf

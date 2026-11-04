@@ -1,0 +1,25 @@
+# Compiled binaries & build artifacts
+/bin/
+/dist/
+/da-resourced
+/da-resourced.exe
+*.tar.gz
+checksums.txt
+manifest.json
+
+# Runtime & live server user configurations (never commit live customer data)
+plugin/data/default.conf
+plugin/data/packages/*.conf
+plugin/data/users/*.conf
+updater.conf
+*.sock
+*.log
+
+# OS & IDE files
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*~

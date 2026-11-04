@@ -1,0 +1,22 @@
+; DirectAdmin Custom PHP-FPM Pool Template Snippet for DA-ResourceLimiter
+; Target copy destination (handled safely by install.sh):
+;   /usr/local/directadmin/data/templates/custom/php-fpm.conf
+;
+; Injects per-user DA_PHP_MAX_CHILDREN and DA_PHP_MEM_LIMIT tokens managed in
+; /usr/local/directadmin/data/users/<username>/user.conf
+
+|*if DA_PHP_MAX_CHILDREN!=""|
+pm.max_children = |DA_PHP_MAX_CHILDREN|
+|*else|
+pm.max_children = 10
+|*endif|
+
+|*if DA_PHP_MEM_LIMIT!=""|
+php_admin_value[memory_limit] = |DA_PHP_MEM_LIMIT|
+|*else|
+php_admin_value[memory_limit] = 256M
+|*endif|
+
+pm = ondemand
+pm.process_idle_timeout = 10s
+pm.max_requests = 500
