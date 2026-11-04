@@ -133,7 +133,7 @@ install_from_bundle() {
     mkdir -p "$PLUGIN_DEST" "${PLUGIN_DEST}/scripts" "${PLUGIN_DEST}/data/packages" "${PLUGIN_DEST}/data/users"
 
     local sub
-    for sub in admin user hooks templates; do
+    for sub in admin user hooks images templates; do
         rm -rf "${PLUGIN_DEST:?}/${sub}"
         cp -a "${bundle_dir}/plugin/${sub}" "${PLUGIN_DEST}/${sub}"
     done
@@ -155,6 +155,7 @@ install_from_bundle() {
             "${PLUGIN_DEST}/admin" \
             "${PLUGIN_DEST}/user" \
             "${PLUGIN_DEST}/hooks" \
+            "${PLUGIN_DEST}/images" \
             "${PLUGIN_DEST}/templates" \
             "${PLUGIN_DEST}/data"
 
@@ -163,6 +164,8 @@ install_from_bundle() {
             chmod 0600 /usr/local/directadmin/data/users/*/user.conf 2>/dev/null || true
         fi
     fi
+    chmod 0755 "${PLUGIN_DEST}/images" 2>/dev/null || true
+    chmod 0644 "${PLUGIN_DEST}/images"/* 2>/dev/null || true
     chmod 0755 \
         "${PLUGIN_DEST}/admin/index.html" \
         "${PLUGIN_DEST}/admin/api.raw" \

@@ -39,13 +39,14 @@ EOF
 }
 
 fix_permissions() {
-    mkdir -p "${PLUGIN_DEST}/data/packages" "${PLUGIN_DEST}/data/users"
+    mkdir -p "${PLUGIN_DEST}/data/packages" "${PLUGIN_DEST}/data/users" "${PLUGIN_DEST}/images"
     if id diradmin >/dev/null 2>&1; then
         chown -R diradmin:diradmin \
             "${PLUGIN_DEST}/plugin.conf" \
             "${PLUGIN_DEST}/admin" \
             "${PLUGIN_DEST}/user" \
             "${PLUGIN_DEST}/hooks" \
+            "${PLUGIN_DEST}/images" \
             "${PLUGIN_DEST}/templates" \
             "${PLUGIN_DEST}/data" 2>/dev/null || true
 
@@ -55,6 +56,8 @@ fix_permissions() {
             chmod 0600 /usr/local/directadmin/data/users/*/user.conf 2>/dev/null || true
         fi
     fi
+    chmod 0755 "${PLUGIN_DEST}/images" 2>/dev/null || true
+    chmod 0644 "${PLUGIN_DEST}/images"/* 2>/dev/null || true
     chmod 0755 \
         "${PLUGIN_DEST}/admin/index.html" \
         "${PLUGIN_DEST}/admin/api.raw" \
@@ -166,7 +169,7 @@ restore_snapshot_archive() {
 
     # Restore code/UI/scripts while strictly preserving live customer plugin/data/
     local sub
-    for sub in admin user hooks templates scripts; do
+    for sub in admin user hooks images templates scripts; do
         if [[ -d "${restore_tmp}/plugin/${sub}" ]]; then
             rm -rf "${PLUGIN_DEST:?}/${sub}"
             cp -a "${restore_tmp}/plugin/${sub}" "${PLUGIN_DEST}/${sub}"
@@ -215,7 +218,7 @@ case "$MODE" in
         mv -f "${BIN_DEST}.new" "$BIN_DEST"
 
         # 2. Update plugin UI/code WITHOUT touching plugin/data/
-        for subdir in admin user hooks templates; do
+        for subdir in admin user hooks images templates; do
             if [[ -d "${STAGE_DIR}/plugin/${subdir}" ]]; then
                 rm -rf "${PLUGIN_DEST:?}/${subdir}"
                 cp -a "${STAGE_DIR}/plugin/${subdir}" "${PLUGIN_DEST}/${subdir}"
