@@ -305,8 +305,49 @@ func (e *Engine) BuildUserSnapshot(acct dausers.Account, include24hCounts bool) 
 	return snap
 }
 
+// IsAuthorizedAdminUID verifies via Linux Kernel SO_PEERCRED UID whether the caller is root (0),
+// diradmin, or a DirectAdmin Administrator listed in admin.list / user.conf (usertype=admin).
+func (e *Engine) IsAuthorizedAdminUID(peerUID uint32) (string, bool) {
+	if peerUID == 0 {
+		return "root", true
+	}
+	if e.DiradminUID > 0 && peerUID == e.DiradminUID {
+		return "diradmin", true
+	}
+
+	username := lookupUsernameByUID(e.PasswdPath, peerUID)
+	if username == "" || config.ValidateIdentifier(username) != nil {
+		return "", false
+	}
+	if username == "diradmin" {
+		return "diradmin", true
+	}
+
+	for _, adm := range readLinesList(filepath.Join(e.DADataRoot, "admin", "admin.list")) {
+		if adm == username {
+			return username, true
+		}
+	}
+
+	userConfPath := filepath.Join(e.DAUsersDir, username, "user.conf")
+	if kv, err := config.ParseKeyValueFile(userConfPath); err == nil {
+		if strings.EqualFold(strings.TrimSpace(kv["usertype"]), "admin") {
+			return username, true
+		}
+	}
+
+	return "", false
+}
+
 // HandleAdminRequest implements ipc.RequestHandler for /var/run/da-resourced.sock.
-func (e *Engine) HandleAdminRequest(ctx context.Context, req ipc.Request) ipc.Response {
+func (e *Engine) HandleAdminRequest(ctx context.Context, peerUID uint32, req ipc.Request) ipc.Response {
+	if _, ok := e.IsAuthorizedAdminUID(peerUID); !ok {
+		return ipc.Response{
+			OK:    false,
+			Error: fmt.Sprintf("permission denied: caller UID %d is not a DirectAdmin administrator", peerUID),
+		}
+	}
+
 	switch req.Action {
 	case ipc.ActionPing:
 		return ipc.Response{OK: true, Data: e.buildPingData()}
@@ -481,11 +522,39 @@ func (e *Engine) HandleUserRequest(_ context.Context, peerUID uint32, req ipc.Re
 	var acct dausers.Account
 	var ok bool
 
-	// Only root (UID 0) or diradmin may specify req.Username; customer processes are locked to their kernel SO_PEERCRED UID
-	if peerUID == 0 || (e.DiradminUID > 0 && peerUID == e.DiradminUID) {
-		acct, ok = e.Registry.LookupByName(req.Username)
+	// Only root, diradmin, or a DirectAdmin Administrator may inspect arbitrary req.Username;
+	// regular customer processes are strictly locked to their kernel SO_PEERCRED UID.
+	if adminName, isAdmin := e.IsAuthorizedAdminUID(peerUID); isAdmin {
+		if req.Username != "" {
+			acct, ok = e.Registry.LookupByName(req.Username)
+		}
 		if !ok {
-			return ipc.Response{OK: false, Error: "hosting user not found"}
+			cgStats, _ := e.CgroupMgr.ReadSliceStats(peerUID)
+			displayName := adminName
+			if req.Username != "" && config.ValidateIdentifier(req.Username) == nil {
+				displayName = req.Username
+			}
+			switch req.Action {
+			case ipc.ActionGetUserStats:
+				return ipc.Response{
+					OK: true,
+					Data: ipc.UserPortalData{
+						Snapshot: ipc.UserUsageSnapshot{
+							Username:        displayName,
+							UID:             peerUID,
+							Package:         "admin (Miễn trừ giới hạn)",
+							CPUPercent:      cgStats.CPUPercent,
+							MemoryCurrentMB: cgStats.MemoryCurrentMB,
+							ActiveProcesses: cgStats.ActiveProcesses,
+							Limits:          config.ResourceLimits{Enabled: false},
+						},
+					},
+				}
+			case ipc.ActionGetLogs:
+				return ipc.Response{OK: true, Data: []ipc.ViolationEntry{}}
+			default:
+				return ipc.Response{OK: false, Error: "permission denied: read-only user socket"}
+			}
 		}
 	} else {
 		acct, ok = e.Registry.LookupByUID(peerUID)
@@ -709,4 +778,23 @@ func lookupUserUID(passwdPath, username string) uint32 {
 		}
 	}
 	return 0
+}
+
+func lookupUsernameByUID(passwdPath string, targetUID uint32) string {
+	f, err := os.Open(passwdPath)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		parts := strings.Split(sc.Text(), ":")
+		if len(parts) >= 3 {
+			if uid, err := strconv.ParseUint(parts[2], 10, 32); err == nil && uint32(uid) == targetUID {
+				return strings.TrimSpace(parts[0])
+			}
+		}
+	}
+	return ""
 }

@@ -182,23 +182,36 @@ cat <<'DARL_USER_HTML'
             banner.style.display = 'none';
           }
 
-          document.getElementById('du-cpu-text').textContent = (s.cpu_percent || 0).toFixed(1) + '% / ' + (lim.cpu_quota || 0) + '%';
-          setBar('du-cpu-bar', s.cpu_percent || 0, lim.cpu_quota || 100);
+          const unlimited = lim.enabled === false;
+          document.getElementById('du-cpu-text').textContent = unlimited
+            ? (s.cpu_percent || 0).toFixed(1) + '% / Không giới hạn'
+            : (s.cpu_percent || 0).toFixed(1) + '% / ' + (lim.cpu_quota || 0) + '%';
+          setBar('du-cpu-bar', unlimited ? 0 : (s.cpu_percent || 0), lim.cpu_quota || 100);
 
-          document.getElementById('du-ram-text').textContent = (s.memory_current_mb || 0).toFixed(1) + ' MB / ' + (lim.mem_max_mb || 0) + ' MB';
-          setBar('du-ram-bar', s.memory_current_mb || 0, lim.mem_max_mb || 1024);
-          document.getElementById('du-ram-sub').textContent = 'Ngưỡng bóp mềm (MemoryHigh): ' + (lim.mem_high_mb || 0) + ' MB';
+          document.getElementById('du-ram-text').textContent = unlimited
+            ? (s.memory_current_mb || 0).toFixed(1) + ' MB / Không giới hạn'
+            : (s.memory_current_mb || 0).toFixed(1) + ' MB / ' + (lim.mem_max_mb || 0) + ' MB';
+          setBar('du-ram-bar', unlimited ? 0 : (s.memory_current_mb || 0), lim.mem_max_mb || 1024);
+          document.getElementById('du-ram-sub').textContent = unlimited
+            ? 'Tài khoản miễn trừ giới hạn tài nguyên'
+            : 'Ngưỡng bóp mềm (MemoryHigh): ' + (lim.mem_high_mb || 0) + ' MB';
 
-          document.getElementById('du-proc-text').textContent = (s.active_processes || 0) + ' / ' + (lim.tasks_max || 0);
-          setBar('du-proc-bar', s.active_processes || 0, lim.tasks_max || 100);
-          document.getElementById('du-proc-sub').textContent =
-            'PHP Max Children: ' + (lim.php_max_children || 0) + ' (' + (lim.php_mem_limit_mb || 0) + 'MB/worker)';
+          document.getElementById('du-proc-text').textContent = unlimited
+            ? (s.active_processes || 0) + ' / Không giới hạn'
+            : (s.active_processes || 0) + ' / ' + (lim.tasks_max || 0);
+          setBar('du-proc-bar', unlimited ? 0 : (s.active_processes || 0), lim.tasks_max || 100);
+          document.getElementById('du-proc-sub').textContent = unlimited
+            ? 'PHP Workers: Không giới hạn'
+            : 'PHP Max Children: ' + (lim.php_max_children || 0) + ' (' + (lim.php_mem_limit_mb || 0) + 'MB/worker)';
 
-          document.getElementById('du-sql-text').textContent = (s.mysql_memory_mb || 0).toFixed(1) + ' MB / ' + (lim.mysql_max_mem_mb || 0) + ' MB';
-          setBar('du-sql-bar', s.mysql_memory_mb || 0, lim.mysql_max_mem_mb || 256);
-          document.getElementById('du-sql-sub').textContent =
-            'Kết nối: ' + (s.mysql_total_conns || 0) + ' / ' + (lim.mysql_max_connections || 0) +
-            ' (Đang chạy: ' + (s.mysql_active_queries || 0) + ' / ' + (lim.mysql_max_active_queries || 0) + ', tối đa ' + (lim.mysql_max_statement_time_sec || 0) + 's/query)';
+          document.getElementById('du-sql-text').textContent = unlimited
+            ? (s.mysql_memory_mb || 0).toFixed(1) + ' MB / Không giới hạn'
+            : (s.mysql_memory_mb || 0).toFixed(1) + ' MB / ' + (lim.mysql_max_mem_mb || 0) + ' MB';
+          setBar('du-sql-bar', unlimited ? 0 : (s.mysql_memory_mb || 0), lim.mysql_max_mem_mb || 256);
+          document.getElementById('du-sql-sub').textContent = unlimited
+            ? 'Kết nối MySQL: Không áp trần giới hạn'
+            : 'Kết nối: ' + (s.mysql_total_conns || 0) + ' / ' + (lim.mysql_max_connections || 0) +
+              ' (Đang chạy: ' + (s.mysql_active_queries || 0) + ' / ' + (lim.mysql_max_active_queries || 0) + ', tối đa ' + (lim.mysql_max_statement_time_sec || 0) + 's/query)';
 
           document.getElementById('du-cnt-high').textContent = String(s.memory_high_events || 0);
           document.getElementById('du-cnt-oom').textContent = String(s.oom_kills_24h || 0);

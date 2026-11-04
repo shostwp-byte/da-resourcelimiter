@@ -21,15 +21,15 @@ const maxRequestBytes = 64 * 1024
 
 // RequestHandler processes decoded IPC requests for Admin and User sockets.
 type RequestHandler interface {
-	HandleAdminRequest(ctx context.Context, req Request) Response
+	HandleAdminRequest(ctx context.Context, peerUID uint32, req Request) Response
 	HandleUserRequest(ctx context.Context, peerUID uint32, req Request) Response
 }
 
 // PeerUIDFunc extracts the kernel-authenticated OS UID of a connected Unix socket client.
 type PeerUIDFunc func(conn net.Conn) (uint32, error)
 
-// Server listens on the privileged Admin Unix Socket (0660 root:diradmin)
-// and the read-only Customer Unix Socket (0666 with SO_PEERCRED isolation).
+// Server listens on the Admin Unix Socket and the read-only Customer Unix Socket,
+// authenticating every caller via Linux Kernel SO_PEERCRED UID verification.
 type Server struct {
 	AdminSocketPath string
 	UserSocketPath  string
@@ -57,8 +57,11 @@ func NewServer(adminSock, userSock string, handler RequestHandler) *Server {
 }
 
 // Start binds both Unix sockets and serves requests until ctx is cancelled.
+// Note: DirectAdmin executes /CMD_PLUGINS_ADMIN scripts under the OS UID of the logged-in
+// DirectAdmin Administrator (e.g. "admin" or secondary admins in admin.list, not group "diradmin").
+// Both sockets therefore bind 0666 and enforce unforgeable Linux Kernel SO_PEERCRED UID checks on accept.
 func (s *Server) Start(ctx context.Context) error {
-	adminLn, err := listenUnixSocket(s.AdminSocketPath, 0o660, lookupGroupGID(s.GroupFilePath, "diradmin"))
+	adminLn, err := listenUnixSocket(s.AdminSocketPath, 0o666, -1)
 	if err != nil {
 		return fmt.Errorf("listen admin socket %s: %w", s.AdminSocketPath, err)
 	}
@@ -127,15 +130,16 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, isAdminSocket boo
 		return
 	}
 
+	peerUID, err := s.GetPeerUID(conn)
+	if err != nil {
+		writeResponse(conn, Response{OK: false, Error: "unable to verify peer kernel credentials: " + err.Error()})
+		return
+	}
+
 	var resp Response
 	if isAdminSocket {
-		resp = s.Handler.HandleAdminRequest(ctx, req)
+		resp = s.Handler.HandleAdminRequest(ctx, peerUID, req)
 	} else {
-		peerUID, err := s.GetPeerUID(conn)
-		if err != nil {
-			writeResponse(conn, Response{OK: false, Error: "unable to verify peer kernel credentials: " + err.Error()})
-			return
-		}
 		resp = s.Handler.HandleUserRequest(ctx, peerUID, req)
 	}
 

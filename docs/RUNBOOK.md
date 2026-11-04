@@ -112,7 +112,7 @@ Hệ thống tích hợp sẵn GitHub Actions (`.github/workflows/release.yml`).
 ### 5.2. Các tình huống thường gặp
 1. **Giao diện Admin báo `DAEMON OFFLINE`:**
    * Kiểm tra dịch vụ: `systemctl status da-resourced` và `journalctl -u da-resourced -n 50 --no-pager`.
-   * Đảm bảo quyền socket `/var/run/da-resourced.sock` thuộc nhóm `diradmin` (`ls -l /var/run/da-resourced*.sock`).
+   * Đảm bảo socket `/var/run/da-resourced.sock` đang tồn tại (`ls -l /var/run/da-resourced*.sock`) và tài khoản quản trị đăng nhập nằm trong `/usr/local/directadmin/data/admin/admin.list` (xác thực nhân Linux `SO_PEERCRED`).
 2. **Khách hàng phản ánh lỗi kết nối MySQL (`User ... has exceeded the 'max_user_connections' resource`):**
    * Vào **Tab 1** hoặc **Tab 3** kiểm tra xem User có đang gắn nhãn **Penalty Throttled** không, và mở **Tab 4 (Violation Logs)** lọc theo Username để gửi chính xác câu lệnh `SELECT` bị nghẽn cho khách hàng đánh thêm Index.
    * Nếu khách hàng vừa sửa xong code và cần mở khoá ngay mà không đợi hết 300 giây: bấm nút **Unblock Penalty** trên giao diện hoặc gõ `da-resourced unblock <username>`.

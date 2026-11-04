@@ -28,15 +28,20 @@ func TestEngineUserIsolationAndPackageSyncRespectsCustomOverride(t *testing.T) {
 
 	passwd := "" +
 		"diradmin:x:995:995::/usr/local/directadmin:/bin/false\n" +
+		"admin:x:1001:1001::/home/admin:/bin/bash\n" +
 		"alice:x:1005:1005::/home/alice:/bin/bash\n" +
 		"bob:x:1006:1006::/home/bob:/bin/bash\n"
 	_ = os.WriteFile(passwdPath, []byte(passwd), 0o644)
+
+	_ = os.MkdirAll(filepath.Join(daUsersDir, "admin"), 0o755)
+	_ = os.WriteFile(filepath.Join(daUsersDir, "admin", "user.conf"), []byte("usertype=admin\n"), 0o600)
 
 	for _, u := range []string{"alice", "bob"} {
 		_ = os.MkdirAll(filepath.Join(daUsersDir, u), 0o755)
 		_ = os.WriteFile(filepath.Join(daUsersDir, u, "user.conf"), []byte("usertype=user\npackage=gold\n"), 0o600)
 	}
 	_ = os.MkdirAll(filepath.Join(daRoot, "admin"), 0o755)
+	_ = os.WriteFile(filepath.Join(daRoot, "admin", "admin.list"), []byte("admin\n"), 0o644)
 	_ = os.WriteFile(filepath.Join(daRoot, "admin", "packages.list"), []byte("gold\nsilver\n"), 0o644)
 
 	store := config.NewStore(dataDir, filepath.Join(tmp, "updater.conf"))
@@ -47,22 +52,28 @@ func TestEngineUserIsolationAndPackageSyncRespectsCustomOverride(t *testing.T) {
 
 	eng := New(store, reg, cgMgr, nil, nil, vlog, daRoot, passwdPath)
 
-	// Give bob a custom VIP override (400% CPU)
+	// Verify regular hosting customer UID 1005 (alice) is strictly blocked on Admin socket
+	deniedAdmin := eng.HandleAdminRequest(context.Background(), 1005, ipc.Request{Action: ipc.ActionPing})
+	if deniedAdmin.OK {
+		t.Fatalf("expected non-admin UID 1005 to be blocked from Admin socket, got %+v", deniedAdmin)
+	}
+
+	// Verify DirectAdmin "admin" OS user (UID 1001) is authorized on Admin socket!
 	vipLimits := config.DefaultLimits()
 	vipLimits.CPUQuota = 400
-	resp := eng.HandleAdminRequest(context.Background(), ipc.Request{
+	resp := eng.HandleAdminRequest(context.Background(), 1001, ipc.Request{
 		Action:   ipc.ActionSaveUserLimits,
 		Username: "bob",
 		Limits:   &vipLimits,
 	})
 	if !resp.OK {
-		t.Fatalf("SaveUserLimits bob failed: %+v", resp)
+		t.Fatalf("SaveUserLimits bob as DA admin (UID 1001) failed: %+v", resp)
 	}
 
 	// Update package "gold" to 200% CPU with SyncUsers=true -> must sync alice (1 user), skipping bob's custom override!
 	goldLimits := config.DefaultLimits()
 	goldLimits.CPUQuota = 200
-	pkgResp := eng.HandleAdminRequest(context.Background(), ipc.Request{
+	pkgResp := eng.HandleAdminRequest(context.Background(), 0, ipc.Request{
 		Action:    ipc.ActionSavePackageLimits,
 		Package:   "gold",
 		SyncUsers: true,

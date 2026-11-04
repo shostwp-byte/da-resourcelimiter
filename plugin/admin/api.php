@@ -3,7 +3,8 @@ declare(strict_types=1);
 
 /**
  * DirectAdmin Admin-Level JSON IPC Relay (invoked via admin/api.raw with `php -n`).
- * Communicates exclusively over the root:diradmin 0660 Unix socket /var/run/da-resourced.sock.
+ * Communicates over /var/run/da-resourced.sock where Linux Kernel SO_PEERCRED verifies
+ * that the caller UID is root, diradmin, or a DirectAdmin Administrator (admin.list).
  */
 
 function emit_json(array $body, int $status = 200): void
@@ -17,12 +18,14 @@ function emit_json(array $body, int $status = 200): void
     exit(0);
 }
 
-function read_da_request(): array
+function read_da_request(bool &$detectedPost): array
 {
+    $detectedPost = false;
     $params = [];
+
     $qs = getenv('QUERY_STRING');
     if (is_string($qs) && $qs !== '') {
-        parse_str($qs, $getParams);
+        parse_str(html_entity_decode($qs, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'), $getParams);
         if (is_array($getParams)) {
             $params = array_merge($params, $getParams);
         }
@@ -30,39 +33,51 @@ function read_da_request(): array
 
     $postEnv = getenv('POST');
     if (is_string($postEnv) && $postEnv !== '') {
-        $trimPost = trim($postEnv);
+        $detectedPost = true;
+        $cleanPost = html_entity_decode($postEnv, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $trimPost = trim($cleanPost);
         if ($trimPost !== '' && ($trimPost[0] === '{' || $trimPost[0] === '[')) {
             $decoded = json_decode($trimPost, true);
             if (is_array($decoded)) {
                 return array_merge($params, $decoded);
             }
         }
-        parse_str($postEnv, $postParams);
+        parse_str($cleanPost, $postParams);
         if (is_array($postParams)) {
             $params = array_merge($params, $postParams);
         }
     } else {
-        $len = (int) (getenv('CONTENT_LENGTH') ?: 0);
-        if ($len > 0 && $len <= 65536) {
-            $rawStdin = stream_get_contents(STDIN, $len);
-            if (is_string($rawStdin) && $rawStdin !== '') {
-                $trimRaw = trim($rawStdin);
-                if ($trimRaw !== '' && ($trimRaw[0] === '{' || $trimRaw[0] === '[')) {
-                    $decoded = json_decode($trimRaw, true);
-                    if (is_array($decoded)) {
-                        return array_merge($params, $decoded);
-                    }
+        $rawStdin = @file_get_contents('php://input', false, null, 0, 65536);
+        if (is_string($rawStdin) && $rawStdin !== '') {
+            $detectedPost = true;
+            $trimRaw = trim($rawStdin);
+            if ($trimRaw !== '' && ($trimRaw[0] === '{' || $trimRaw[0] === '[')) {
+                $decoded = json_decode($trimRaw, true);
+                if (is_array($decoded)) {
+                    return array_merge($params, $decoded);
                 }
-                parse_str($rawStdin, $stdinParams);
-                if (is_array($stdinParams)) {
-                    $params = array_merge($params, $stdinParams);
-                }
+            }
+            parse_str($rawStdin, $stdinParams);
+            if (is_array($stdinParams)) {
+                $params = array_merge($params, $stdinParams);
+            }
+        }
+    }
+
+    if (isset($params['payload_b64']) && is_string($params['payload_b64'])) {
+        $rawJson = base64_decode($params['payload_b64'], true);
+        if (is_string($rawJson) && $rawJson !== '') {
+            $decoded = json_decode($rawJson, true);
+            if (is_array($decoded)) {
+                unset($params['payload_b64']);
+                $params = array_merge($params, $decoded);
             }
         }
     }
 
     if (isset($params['payload']) && is_string($params['payload'])) {
-        $decoded = json_decode($params['payload'], true);
+        $cleanPayload = html_entity_decode($params['payload'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $decoded = json_decode($cleanPayload, true);
         if (is_array($decoded)) {
             unset($params['payload']);
             $params = array_merge($params, $decoded);
@@ -95,17 +110,20 @@ $mutatingActions = [
     'rollback_update' => true,
 ];
 
-$input = read_da_request();
+$detectedPost = false;
+$input = read_da_request($detectedPost);
 $action = isset($input['action']) && is_string($input['action']) ? trim($input['action']) : 'ping';
 
 if (!isset($readOnlyActions[$action]) && !isset($mutatingActions[$action])) {
     emit_json(['ok' => false, 'error' => "Unsupported admin action: {$action}"], 400);
 }
 
-$method = strtoupper((string) (getenv('REQUEST_METHOD') ?: 'GET'));
-if (isset($mutatingActions[$action]) && $method !== 'POST') {
+$envMethod = strtoupper((string) (getenv('REQUEST_METHOD') ?: ''));
+$isPost = ($envMethod === 'POST') || $detectedPost || (isset($input['pipe_post']) && $input['pipe_post'] === 'yes' && $envMethod === '');
+if (isset($mutatingActions[$action]) && !$isPost) {
     emit_json(['ok' => false, 'error' => 'Mutating actions require HTTP POST'], 405);
 }
+unset($input['pipe_post']);
 
 $sockPath = getenv('DA_LIMITER_ADMIN_SOCK') ?: '/var/run/da-resourced.sock';
 $errno = 0;

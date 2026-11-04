@@ -9,7 +9,10 @@ import (
 
 type stubHandler struct{}
 
-func (stubHandler) HandleAdminRequest(_ context.Context, req Request) Response {
+func (stubHandler) HandleAdminRequest(_ context.Context, peerUID uint32, req Request) Response {
+	if peerUID != 0 && peerUID != 1001 {
+		return Response{OK: false, Error: "permission denied: non-admin UID"}
+	}
 	return Response{OK: true, Message: "admin:" + req.Action}
 }
 
@@ -26,7 +29,24 @@ func TestServeConnAdminAndUserIsolation(t *testing.T) {
 		return 1005, nil
 	}
 
-	// 1. Test Admin Socket connection
+	// 1. Test Admin Socket blocks non-admin UID (1005) via SO_PEERCRED
+	c0, s0 := net.Pipe()
+	go srv.ServeConn(context.Background(), s0, true)
+
+	_ = json.NewEncoder(c0).Encode(Request{Action: ActionApplyUserLimits, Username: "vinahost"})
+	var blockedAdminResp Response
+	if err := json.NewDecoder(c0).Decode(&blockedAdminResp); err != nil {
+		t.Fatalf("decode blocked admin response: %v", err)
+	}
+	_ = c0.Close()
+	if blockedAdminResp.OK {
+		t.Fatalf("expected non-admin UID 1005 to be rejected on admin socket, got %+v", blockedAdminResp)
+	}
+
+	// 2. Test Admin Socket allows DirectAdmin admin UID (1001)
+	srv.GetPeerUID = func(_ net.Conn) (uint32, error) {
+		return 1001, nil
+	}
 	c1, s1 := net.Pipe()
 	go srv.ServeConn(context.Background(), s1, true)
 
@@ -38,6 +58,10 @@ func TestServeConnAdminAndUserIsolation(t *testing.T) {
 	_ = c1.Close()
 	if !adminResp.OK || adminResp.Message != "admin:apply_user_limits" {
 		t.Fatalf("unexpected admin response: %+v", adminResp)
+	}
+
+	srv.GetPeerUID = func(_ net.Conn) (uint32, error) {
+		return 1005, nil
 	}
 
 	// 2. Test User Socket blocks privileged actions
