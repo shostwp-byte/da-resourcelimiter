@@ -1,0 +1,236 @@
+#!/bin/sh
+cat <<'DARL_USER_HTML'
+<div id="darl-user-root">
+  <style>
+    #darl-user-root {
+      --bg: #f8fafc;
+      --card: #ffffff;
+      --border: #e2e8f0;
+      --text: #0f172a;
+      --muted: #64748b;
+      --primary: #0284c7;
+      --success: #16a34a;
+      --warn: #d97706;
+      --danger: #dc2626;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      color: var(--text);
+      background: var(--bg);
+      padding: 18px;
+      border-radius: 10px;
+      box-sizing: border-box;
+    }
+    #darl-user-root * { box-sizing: border-box; }
+    .du-header {
+      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+      gap: 10px; margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid var(--border);
+    }
+    .du-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(235px, 1fr));
+      gap: 14px; margin-bottom: 16px;
+    }
+    .du-card {
+      background: var(--card); border: 1px solid var(--border); border-radius: 9px; padding: 15px;
+    }
+    .du-label { font-size: 12.5px; font-weight: 600; color: var(--muted); }
+    .du-val { font-size: 20px; font-weight: 700; margin: 6px 0 8px 0; }
+    .du-sub { font-size: 12px; color: var(--muted); margin-top: 6px; }
+    .du-bar { height: 9px; background: #e2e8f0; border-radius: 999px; overflow: hidden; }
+    .du-bar > span { display: block; height: 100%; background: var(--primary); transition: width .25s ease; }
+    .du-bar > span.warn { background: var(--warn); }
+    .du-bar > span.crit { background: var(--danger); }
+    .du-alert {
+      display: none; padding: 12px 15px; border-radius: 8px; margin-bottom: 16px;
+      background: #fee2e2; border: 1px solid #fca5a5; color: #991b1b; font-size: 13.5px;
+    }
+    .du-btn {
+      padding: 7px 12px; border: 1px solid #cbd5e1; background: #fff; border-radius: 6px;
+      font-size: 13px; font-weight: 600; cursor: pointer; color: var(--text);
+    }
+    .du-btn:hover { background: #f1f5f9; }
+    table.du-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+    table.du-table th, table.du-table td {
+      padding: 9px 10px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top;
+    }
+    table.du-table th { background: #f8fafc; color: var(--muted); font-weight: 600; }
+    .du-mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px; background: #f1f5f9; padding: 5px 8px; border-radius: 5px; word-break: break-all;
+    }
+    .du-pill {
+      display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 600;
+    }
+    .du-pill-ok { background: #dcfce7; color: #166534; }
+    .du-pill-warn { background: #fef3c7; color: #92400e; }
+    .du-pill-err { background: #fee2e2; color: #991b1b; }
+  </style>
+
+  <div class="du-header">
+    <div>
+      <h2 style="margin:0;font-size:19px;">Tài Nguyên Sử Dụng Thực Tế (Resource Usage)</h2>
+      <div id="du-acct-meta" style="font-size:12.5px;color:var(--muted);margin-top:3px;">Đang tải thông số tài khoản...</div>
+    </div>
+    <button type="button" class="du-btn" id="du-refresh">Làm mới (Auto 5s)</button>
+  </div>
+
+  <div id="du-penalty-banner" class="du-alert"></div>
+
+  <div class="du-grid">
+    <div class="du-card">
+      <div class="du-label">CPU Usage</div>
+      <div class="du-val" id="du-cpu-text">-</div>
+      <div class="du-bar"><span id="du-cpu-bar" style="width:0%"></span></div>
+      <div class="du-sub" id="du-cpu-sub">100% tương đương 1 vCore xử lý</div>
+    </div>
+
+    <div class="du-card">
+      <div class="du-label">Physical Memory (RAM)</div>
+      <div class="du-val" id="du-ram-text">-</div>
+      <div class="du-bar"><span id="du-ram-bar" style="width:0%"></span></div>
+      <div class="du-sub" id="du-ram-sub">Ngưỡng bóp mềm (MemoryHigh): -</div>
+    </div>
+
+    <div class="du-card">
+      <div class="du-label">Active Processes (PHP / Cron / SSH)</div>
+      <div class="du-val" id="du-proc-text">-</div>
+      <div class="du-bar"><span id="du-proc-bar" style="width:0%"></span></div>
+      <div class="du-sub" id="du-proc-sub">Tối đa PHP-FPM Workers: -</div>
+    </div>
+
+    <div class="du-card">
+      <div class="du-label">MySQL / MariaDB Memory &amp; Connections</div>
+      <div class="du-val" id="du-sql-text">-</div>
+      <div class="du-bar"><span id="du-sql-bar" style="width:0%"></span></div>
+      <div class="du-sub" id="du-sql-sub">Kết nối hiện tại: -</div>
+    </div>
+  </div>
+
+  <div class="du-grid" style="grid-template-columns:repeat(auto-fit, minmax(200px, 1fr));">
+    <div class="du-card">
+      <div class="du-label">Chạm ngưỡng RAM mềm (MemoryHigh)</div>
+      <div class="du-val" id="du-cnt-high">0</div>
+      <div class="du-sub">Lần hệ thống thu hồi bộ nhớ đệm để tránh OOM</div>
+    </div>
+    <div class="du-card">
+      <div class="du-label">Sự kiện Tràn RAM (OOM Kills - 24h qua)</div>
+      <div class="du-val" id="du-cnt-oom">0</div>
+      <div class="du-sub">Tiến trình vượt ngưỡng cứng MemoryMax bị dừng</div>
+    </div>
+    <div class="du-card">
+      <div class="du-label">Truy vấn SQL bị ngắt (24h qua)</div>
+      <div class="du-val" id="du-cnt-sql">0</div>
+      <div class="du-sub">Do chạy quá thời gian hoặc vượt RAM MySQL cho phép</div>
+    </div>
+  </div>
+
+  <div class="du-card">
+    <h3 style="margin:0 0 6px 0;font-size:15px;">Top 5 Câu Lệnh SQL Nặng / Chậm Bị Ngắt Gần Nhất</h3>
+    <div style="font-size:12.5px;color:var(--muted);margin-bottom:8px;">
+      Sử dụng danh sách dưới đây để kiểm tra và bổ sung Index cho bảng cơ sở dữ liệu nhằm tối ưu tốc độ website.
+    </div>
+    <div style="overflow-x:auto;">
+      <table class="du-table">
+        <thead>
+          <tr>
+            <th>Thời gian (UTC)</th>
+            <th>Nguyên nhân</th>
+            <th>Tài nguyên / Thời gian</th>
+            <th>Nội dung truy vấn SQL</th>
+          </tr>
+        </thead>
+        <tbody id="du-sql-tbody">
+          <tr><td colspan="4" style="text-align:center;color:var(--muted);">Không có truy vấn SQL nào bị ngắt.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const STATS_URL = '/CMD_PLUGINS/da_resource_limiter/stats.raw?action=get_user_stats';
+
+      function esc(v) {
+        return String(v === undefined || v === null ? '' : v)
+          .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      }
+
+      function setBar(id, cur, max) {
+        const el = document.getElementById(id);
+        const pct = max > 0 ? Math.min(100, Math.round((cur / max) * 100)) : 0;
+        el.style.width = pct + '%';
+        el.className = pct >= 90 ? 'crit' : (pct >= 75 ? 'warn' : '');
+      }
+
+      async function refreshStats() {
+        try {
+          const res = await fetch(STATS_URL, { credentials: 'same-origin' });
+          const r = await res.json();
+          if (!r.ok) {
+            document.getElementById('du-acct-meta').textContent = r.error || 'Tạm thời không đọc được dữ liệu.';
+            return;
+          }
+          const s = r.data.snapshot;
+          const lim = s.limits || {};
+          document.getElementById('du-acct-meta').textContent =
+            'Tài khoản: ' + s.username + ' | Gói Hosting: ' + (s.package || 'default');
+
+          const banner = document.getElementById('du-penalty-banner');
+          if (s.penalty_active) {
+            const rem = Math.max(0, s.penalty_expires_unix - Math.floor(Date.now() / 1000));
+            banner.style.display = 'block';
+            banner.textContent = 'Cảnh báo: Tài khoản MySQL đang tạm thời bị giới hạn kết nối (Penalty Box) do phát sinh nhiều truy vấn quá tải liên tiếp. Tự động khôi phục sau khoảng ' + rem + ' giây.';
+          } else {
+            banner.style.display = 'none';
+          }
+
+          document.getElementById('du-cpu-text').textContent = (s.cpu_percent || 0).toFixed(1) + '% / ' + (lim.cpu_quota || 0) + '%';
+          setBar('du-cpu-bar', s.cpu_percent || 0, lim.cpu_quota || 100);
+
+          document.getElementById('du-ram-text').textContent = (s.memory_current_mb || 0).toFixed(1) + ' MB / ' + (lim.mem_max_mb || 0) + ' MB';
+          setBar('du-ram-bar', s.memory_current_mb || 0, lim.mem_max_mb || 1024);
+          document.getElementById('du-ram-sub').textContent = 'Ngưỡng bóp mềm (MemoryHigh): ' + (lim.mem_high_mb || 0) + ' MB';
+
+          document.getElementById('du-proc-text').textContent = (s.active_processes || 0) + ' / ' + (lim.tasks_max || 0);
+          setBar('du-proc-bar', s.active_processes || 0, lim.tasks_max || 100);
+          document.getElementById('du-proc-sub').textContent =
+            'PHP Max Children: ' + (lim.php_max_children || 0) + ' (' + (lim.php_mem_limit_mb || 0) + 'MB/worker)';
+
+          document.getElementById('du-sql-text').textContent = (s.mysql_memory_mb || 0).toFixed(1) + ' MB / ' + (lim.mysql_max_mem_mb || 0) + ' MB';
+          setBar('du-sql-bar', s.mysql_memory_mb || 0, lim.mysql_max_mem_mb || 256);
+          document.getElementById('du-sql-sub').textContent =
+            'Kết nối: ' + (s.mysql_total_conns || 0) + ' / ' + (lim.mysql_max_connections || 0) +
+            ' (Đang chạy: ' + (s.mysql_active_queries || 0) + ' / ' + (lim.mysql_max_active_queries || 0) + ', tối đa ' + (lim.mysql_max_statement_time_sec || 0) + 's/query)';
+
+          document.getElementById('du-cnt-high').textContent = String(s.memory_high_events || 0);
+          document.getElementById('du-cnt-oom').textContent = String(s.oom_kills_24h || 0);
+          document.getElementById('du-cnt-sql').textContent = String(s.mysql_kills_24h || 0);
+
+          const top = r.data.top_killed_queries || [];
+          const tbody = document.getElementById('du-sql-tbody');
+          if (!top.length) {
+            tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted);">Tuyệt vời! Không có câu lệnh SQL nào bị ngắt gần đây.</td></tr>';
+          } else {
+            tbody.innerHTML = top.map(function (q) {
+              const reason = q.type === 'mysql_high_memory'
+                ? '<span class="du-pill du-pill-err">Vượt RAM MySQL</span>'
+                : '<span class="du-pill du-pill-warn">Chạy quá lâu / Quá luồng</span>';
+              const meta = (q.memory_mb ? q.memory_mb.toFixed(1) + ' MB' : '') + (q.duration_ms ? ' | ' + q.duration_ms + ' ms' : '');
+              return '<tr>' +
+                '<td style="white-space:nowrap;">' + esc(q.timestamp_iso || '') + '</td>' +
+                '<td>' + reason + '</td>' +
+                '<td style="white-space:nowrap;">' + esc(meta) + '</td>' +
+                '<td><div class="du-mono">' + esc(q.detail) + '</div></td>' +
+              '</tr>';
+            }).join('');
+          }
+        } catch (err) {
+          document.getElementById('du-acct-meta').textContent = 'Lỗi tải dữ liệu: ' + err.message;
+        }
+      }
+
+      document.getElementById('du-refresh').addEventListener('click', refreshStats);
+      refreshStats();
+      setInterval(refreshStats, 5000);
+    })();
+  </script>
+</div>
+DARL_USER_HTML

@@ -1,0 +1,849 @@
+#!/bin/sh
+cat <<'DARL_ADMIN_HTML'
+<div id="darl-root">
+  <style>
+    #darl-root {
+      --bg: #f8fafc;
+      --card: #ffffff;
+      --border: #e2e8f0;
+      --text: #0f172a;
+      --muted: #64748b;
+      --primary: #0284c7;
+      --primary-hover: #0369a1;
+      --success: #16a34a;
+      --warn: #d97706;
+      --danger: #dc2626;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      color: var(--text);
+      background: var(--bg);
+      padding: 18px;
+      border-radius: 10px;
+      box-sizing: border-box;
+    }
+    #darl-root * { box-sizing: border-box; }
+    .darl-header {
+      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+      gap: 12px; margin-bottom: 16px; padding-bottom: 14px; border-bottom: 1px solid var(--border);
+    }
+    .darl-title { display: flex; align-items: center; gap: 10px; margin: 0; font-size: 20px; font-weight: 700; }
+    .darl-badge {
+      display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+      border-radius: 999px; font-size: 12px; font-weight: 600;
+    }
+    .darl-badge-ok { background: #dcfce7; color: #166534; }
+    .darl-badge-err { background: #fee2e2; color: #991b1b; }
+    .darl-badge-warn { background: #fef3c7; color: #92400e; }
+    .darl-badge-info { background: #e0f2fe; color: #075985; }
+    .darl-tabs {
+      display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 18px;
+      border-bottom: 1px solid var(--border); padding-bottom: 8px;
+    }
+    .darl-tab {
+      border: 1px solid transparent; background: transparent; color: var(--muted);
+      padding: 8px 14px; border-radius: 7px; font-size: 13.5px; font-weight: 600; cursor: pointer;
+    }
+    .darl-tab:hover { background: #f1f5f9; color: var(--text); }
+    .darl-tab.active { background: var(--primary); color: #fff; }
+    .darl-panel { display: none; }
+    .darl-panel.active { display: block; }
+    .darl-kpis {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 12px; margin-bottom: 16px;
+    }
+    .darl-card {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 9px; padding: 15px; margin-bottom: 14px;
+    }
+    .darl-kpi-label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+    .darl-kpi-val { font-size: 22px; font-weight: 700; margin-top: 4px; }
+    .darl-toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }
+    .darl-input, .darl-select {
+      padding: 7px 11px; border: 1px solid #cbd5e1; border-radius: 6px;
+      font-size: 13px; background: #fff; color: var(--text);
+    }
+    .darl-btn {
+      padding: 7px 13px; border-radius: 6px; border: 1px solid transparent;
+      font-size: 13px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+    }
+    .darl-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+    .darl-btn-primary { background: var(--primary); color: #fff; }
+    .darl-btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
+    .darl-btn-outline { background: #fff; border-color: #cbd5e1; color: var(--text); }
+    .darl-btn-outline:hover:not(:disabled) { background: #f1f5f9; }
+    .darl-btn-danger { background: var(--danger); color: #fff; }
+    .darl-btn-warn { background: var(--warn); color: #fff; }
+    .darl-table-wrap { overflow-x: auto; }
+    table.darl-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    table.darl-table th, table.darl-table td {
+      padding: 9px 10px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: middle;
+    }
+    table.darl-table th { background: #f8fafc; color: var(--muted); font-weight: 600; white-space: nowrap; }
+    .darl-prog {
+      width: 110px; height: 7px; background: #e2e8f0; border-radius: 999px; overflow: hidden; margin-top: 4px;
+    }
+    .darl-prog > span { display: block; height: 100%; border-radius: 999px; background: var(--primary); }
+    .darl-prog > span.warn { background: var(--warn); }
+    .darl-prog > span.crit { background: var(--danger); }
+    .darl-grid-form {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(195px, 1fr)); gap: 12px;
+    }
+    .darl-field label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 4px; }
+    .darl-field input, .darl-field select { width: 100%; }
+    .darl-mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px; background: #f1f5f9; padding: 4px 7px; border-radius: 5px; word-break: break-all;
+    }
+    .darl-toast {
+      display: none; padding: 10px 14px; border-radius: 7px; margin-bottom: 14px; font-size: 13px; font-weight: 600;
+    }
+    .darl-toast.ok { display: block; background: #dcfce7; color: #166534; border: 1px solid #86efac; }
+    .darl-toast.err { display: block; background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; }
+    .darl-split { display: grid; grid-template-columns: 300px 1fr; gap: 14px; }
+    @media (max-width: 900px) { .darl-split { grid-template-columns: 1fr; } }
+    .darl-user-list { max-height: 520px; overflow-y: auto; border: 1px solid var(--border); border-radius: 7px; }
+    .darl-user-item {
+      padding: 9px 12px; border-bottom: 1px solid var(--border); cursor: pointer;
+      display: flex; justify-content: space-between; align-items: center; font-size: 13px;
+    }
+    .darl-user-item:hover { background: #f1f5f9; }
+    .darl-user-item.selected { background: #e0f2fe; font-weight: 700; }
+    .darl-pre {
+      background: #0f172a; color: #e2e8f0; padding: 12px; border-radius: 7px;
+      font-size: 12px; max-height: 240px; overflow-y: auto; white-space: pre-wrap;
+    }
+  </style>
+
+  <div class="darl-header">
+    <div>
+      <h2 class="darl-title">
+        <span>DA Resource Limiter</span>
+        <span id="darl-daemon-badge" class="darl-badge darl-badge-info">Đang kết nối...</span>
+      </h2>
+      <div id="darl-daemon-meta" style="font-size:12px;color:var(--muted);margin-top:4px;">
+        Cgroups v2 + PHP-FPM/LSPHP Scope + MariaDB 3-Tier Governor
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;">
+      <label style="font-size:12.5px;color:var(--muted);display:flex;align-items:center;gap:5px;cursor:pointer;">
+        <input type="checkbox" id="darl-autorefresh" checked /> Tự làm mới (5s)
+      </label>
+      <button type="button" class="darl-btn darl-btn-outline" id="darl-btn-refresh">Làm mới ngay</button>
+    </div>
+  </div>
+
+  <div id="darl-toast" class="darl-toast"></div>
+
+  <div class="darl-tabs">
+    <button type="button" class="darl-tab active" data-tab="monitor">1. Realtime Monitor</button>
+    <button type="button" class="darl-tab" data-tab="packages">2. Package Limits</button>
+    <button type="button" class="darl-tab" data-tab="users">3. User Overrides</button>
+    <button type="button" class="darl-tab" data-tab="logs">4. Violation &amp; OOM Logs</button>
+    <button type="button" class="darl-tab" data-tab="updater">5. System &amp; GitHub Update</button>
+  </div>
+
+  <!-- TAB 1: REALTIME MONITOR -->
+  <div id="darl-panel-monitor" class="darl-panel active">
+    <div class="darl-kpis">
+      <div class="darl-card"><div class="darl-kpi-label">Hosting Accounts</div><div class="darl-kpi-val" id="kpi-users">-</div></div>
+      <div class="darl-card"><div class="darl-kpi-label">Top CPU Account</div><div class="darl-kpi-val" id="kpi-top-cpu">-</div></div>
+      <div class="darl-card"><div class="darl-kpi-label">Tổng RAM User Đang Dùng</div><div class="darl-kpi-val" id="kpi-total-ram">-</div></div>
+      <div class="darl-card"><div class="darl-kpi-label">Đang Bị Phạt (Penalty Box)</div><div class="darl-kpi-val" id="kpi-penalties">-</div></div>
+    </div>
+
+    <div class="darl-card">
+      <div class="darl-toolbar">
+        <input type="text" id="mon-search" class="darl-input" placeholder="Tìm theo Username hoặc Package..." style="min-width:240px;" />
+        <select id="mon-sort" class="darl-select">
+          <option value="cpu">Sắp xếp: CPU cao nhất</option>
+          <option value="ram">Sắp xếp: Physical RAM cao nhất</option>
+          <option value="mysql">Sắp xếp: MySQL RAM cao nhất</option>
+          <option value="procs">Sắp xếp: Số tiến trình cao nhất</option>
+        </select>
+      </div>
+      <div class="darl-table-wrap">
+        <table class="darl-table">
+          <thead>
+            <tr>
+              <th>User (UID)</th>
+              <th>Package</th>
+              <th>CPU Usage</th>
+              <th>Physical RAM</th>
+              <th>Procs</th>
+              <th>MySQL RAM &amp; Conns</th>
+              <th>Trạng thái</th>
+              <th>Thao tác</th>
+            </tr>
+          </thead>
+          <tbody id="mon-tbody">
+            <tr><td colspan="8" style="text-align:center;color:var(--muted);">Đang tải dữ liệu thời gian thực...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB 2: PACKAGE LIMITS -->
+  <div id="darl-panel-packages" class="darl-panel">
+    <div class="darl-card">
+      <h3 style="margin:0 0 12px 0;font-size:15px;">Danh sách Hosting Packages trên DirectAdmin</h3>
+      <div class="darl-table-wrap">
+        <table class="darl-table">
+          <thead>
+            <tr>
+              <th>Tên Package</th>
+              <th>Số User</th>
+              <th>CPU Quota</th>
+              <th>RAM High / Max</th>
+              <th>PHP Children / Mem</th>
+              <th>MySQL Conn / Mem / Time</th>
+              <th>Cấu hình</th>
+              <th>Chỉnh sửa</th>
+            </tr>
+          </thead>
+          <tbody id="pkg-tbody">
+            <tr><td colspan="8" style="text-align:center;color:var(--muted);">Đang tải danh sách Package...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="darl-card">
+      <h3 id="pkg-form-title" style="margin:0 0 12px 0;font-size:15px;">Chỉnh sửa Cấu hình Mặc định (default.conf)</h3>
+      <input type="hidden" id="pkg-edit-target" value="__default__" />
+      <div id="pkg-fields-container" class="darl-grid-form"></div>
+      <div style="margin-top:14px;display:flex;flex-wrap:wrap;gap:10px;">
+        <button type="button" class="darl-btn darl-btn-primary" id="btn-pkg-save-sync">Save &amp; Sync All Users</button>
+        <button type="button" class="darl-btn darl-btn-outline" id="btn-pkg-save-only">Chỉ lưu cấu hình</button>
+        <button type="button" class="darl-btn darl-btn-outline" id="btn-pkg-edit-default">Chọn lại default.conf</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB 3: USER OVERRIDES -->
+  <div id="darl-panel-users" class="darl-panel">
+    <div class="darl-split">
+      <div class="darl-card" style="margin-bottom:0;">
+        <input type="text" id="usr-search" class="darl-input" placeholder="Tìm nhanh User..." style="width:100%;margin-bottom:8px;" />
+        <select id="usr-filter" class="darl-select" style="width:100%;margin-bottom:10px;">
+          <option value="all">Tất cả Hosting Users</option>
+          <option value="override">Đang bật Custom Override</option>
+          <option value="penalty">Đang trong Penalty Box</option>
+        </select>
+        <div id="usr-list" class="darl-user-list"></div>
+      </div>
+
+      <div class="darl-card" style="margin-bottom:0;">
+        <div id="usr-empty-hint" style="color:var(--muted);padding:24px 0;text-align:center;">
+          Chọn một tài khoản bên trái để xem thông số thực tế và thiết lập giới hạn riêng (Custom Override).
+        </div>
+        <div id="usr-editor-wrap" style="display:none;">
+          <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;margin-bottom:12px;">
+            <div>
+              <h3 id="usr-edit-heading" style="margin:0;font-size:16px;">User</h3>
+              <div id="usr-edit-sub" style="font-size:12px;color:var(--muted);margin-top:3px;"></div>
+            </div>
+            <div style="display:flex;gap:8px;">
+              <button type="button" class="darl-btn darl-btn-warn" id="btn-usr-unblock" style="display:none;">Unblock Penalty</button>
+              <button type="button" class="darl-btn darl-btn-outline" id="btn-usr-reset">Reset về mặc định Package</button>
+            </div>
+          </div>
+          <div id="usr-fields-container" class="darl-grid-form"></div>
+          <div style="margin-top:14px;display:flex;gap:10px;">
+            <button type="button" class="darl-btn darl-btn-primary" id="btn-usr-save">Lưu Custom Override &amp; Áp dụng ngay</button>
+            <button type="button" class="darl-btn darl-btn-outline" id="btn-usr-reapply">Đồng bộ lại xuống OS/MySQL</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB 4: VIOLATION & OOM LOGS -->
+  <div id="darl-panel-logs" class="darl-panel">
+    <div class="darl-card">
+      <div class="darl-toolbar">
+        <input type="text" id="log-user" class="darl-input" placeholder="Lọc theo Username..." />
+        <select id="log-type" class="darl-select">
+          <option value="">Tất cả loại vi phạm</option>
+          <option value="cgroup_oom_kill">Kernel OOM Killed (Cgroups v2)</option>
+          <option value="mysql_high_memory">MySQL High Memory Kill</option>
+          <option value="mysql_slow_query">MySQL Slow / Active Query Kill</option>
+          <option value="mysql_penalty_box">Penalty Box Throttled</option>
+        </select>
+        <select id="log-limit" class="darl-select">
+          <option value="50">50 bản ghi mới nhất</option>
+          <option value="100" selected>100 bản ghi mới nhất</option>
+          <option value="250">250 bản ghi mới nhất</option>
+        </select>
+        <button type="button" class="darl-btn darl-btn-primary" id="btn-log-filter">Lọc nhật ký</button>
+      </div>
+      <div class="darl-table-wrap">
+        <table class="darl-table">
+          <thead>
+            <tr>
+              <th>Thời gian (UTC)</th>
+              <th>Username</th>
+              <th>Loại vi phạm</th>
+              <th>Thông số</th>
+              <th>Chi tiết tiến trình / Câu lệnh SQL bị ngắt</th>
+            </tr>
+          </thead>
+          <tbody id="log-tbody">
+            <tr><td colspan="5" style="text-align:center;color:var(--muted);">Chưa tải dữ liệu nhật ký.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB 5: SYSTEM & GITHUB UPDATE -->
+  <div id="darl-panel-updater" class="darl-panel">
+    <div class="darl-kpis">
+      <div class="darl-card"><div class="darl-kpi-label">Phiên bản đang chạy</div><div class="darl-kpi-val" id="upd-cur-ver">-</div></div>
+      <div class="darl-card"><div class="darl-kpi-label">Phiên bản mới nhất</div><div class="darl-kpi-val" id="upd-latest-ver">Chưa kiểm tra</div></div>
+      <div class="darl-card"><div class="darl-kpi-label">Xác thực GitHub Token</div><div class="darl-kpi-val" id="upd-token-state">-</div></div>
+      <div class="darl-card"><div class="darl-kpi-label">Trạng thái tiến trình Update</div><div class="darl-kpi-val" id="upd-job-state">Idle</div></div>
+    </div>
+
+    <div class="darl-card">
+      <h3 style="margin:0 0 12px 0;font-size:15px;">Kiểm tra &amp; Cập nhật Một chạm từ GitHub Releases</h3>
+      <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:12px;">
+        <button type="button" class="darl-btn darl-btn-outline" id="btn-upd-check">Check for Updates</button>
+        <button type="button" class="darl-btn darl-btn-primary" id="btn-upd-trigger">One-Click Update Now</button>
+        <button type="button" class="darl-btn darl-btn-danger" id="btn-upd-rollback">Rollback Snapshot Trước</button>
+      </div>
+      <div id="upd-notes-wrap" style="display:none;">
+        <div style="font-size:12px;font-weight:600;color:var(--muted);margin-bottom:5px;">Release Notes / Thông tin tiến trình:</div>
+        <pre id="upd-notes" class="darl-pre"></pre>
+      </div>
+    </div>
+
+    <div class="darl-card">
+      <h3 style="margin:0 0 12px 0;font-size:15px;">Cấu hình GitHub Repository (Hỗ trợ cả Public &amp; Private Repo)</h3>
+      <div class="darl-grid-form">
+        <div class="darl-field">
+          <label>GitHub Repository (owner/repo)</label>
+          <input type="text" id="upd-repo" class="darl-input" placeholder="shostwp-byte/da-resourcelimiter" />
+        </div>
+        <div class="darl-field">
+          <label>GitHub Personal Access Token (Tuỳ chọn cho Private Repo)</label>
+          <input type="password" id="upd-token" class="darl-input" placeholder="Để trống nếu giữ nguyên hoặc dùng Public Repo" autocomplete="new-password" />
+        </div>
+        <div class="darl-field">
+          <label>Kênh phát hành (Release Channel)</label>
+          <select id="upd-channel" class="darl-select">
+            <option value="stable">Stable (Khuyến nghị Production)</option>
+            <option value="beta">Beta / Pre-release</option>
+          </select>
+        </div>
+        <div class="darl-field">
+          <label>Số bản Snapshot Backup giữ lại</label>
+          <input type="number" id="upd-retention" class="darl-input" min="1" max="30" value="5" />
+        </div>
+      </div>
+      <div style="margin-top:10px;">
+        <label style="font-size:12.5px;color:var(--muted);display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
+          <input type="checkbox" id="upd-keep-token" checked />
+          Giữ nguyên GitHub Token đang lưu trong <code class="darl-mono">/etc/da-resourced/updater.conf</code> (bỏ tích nếu muốn ghi đè/xoá Token)
+        </label>
+      </div>
+      <div style="margin-top:12px;">
+        <button type="button" class="darl-btn darl-btn-primary" id="btn-upd-save">Lưu cấu hình GitHub Updater</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const API_URL = '/CMD_PLUGINS_ADMIN/da_resource_limiter/api.raw';
+      let cachedUsers = [];
+      let cachedPackages = null;
+      let selectedUsername = '';
+      let activeTab = 'monitor';
+
+      const LIMIT_FIELDS = [
+        { key: 'enabled', label: 'Kích hoạt giới hạn', type: 'bool' },
+        { key: 'cpu_quota', label: 'CPU Quota (% — 100% = 1 Core)', type: 'int' },
+        { key: 'cpu_weight', label: 'CPU Weight (1-10000)', type: 'int' },
+        { key: 'mem_high_mb', label: 'RAM Throttle High (MB)', type: 'int' },
+        { key: 'mem_max_mb', label: 'RAM Hard OOM Max (MB)', type: 'int' },
+        { key: 'io_weight', label: 'Disk I/O Weight (1-10000)', type: 'int' },
+        { key: 'tasks_max', label: 'Max Processes / Threads', type: 'int' },
+        { key: 'php_max_children', label: 'PHP-FPM Max Children', type: 'int' },
+        { key: 'php_mem_limit_mb', label: 'PHP memory_limit (MB)', type: 'int' },
+        { key: 'mysql_max_connections', label: 'MySQL Max Connections', type: 'int' },
+        { key: 'mysql_max_active_queries', label: 'MySQL Max Active Queries', type: 'int' },
+        { key: 'mysql_max_mem_mb', label: 'MySQL Max RAM (MB)', type: 'int' },
+        { key: 'mysql_max_statement_time_sec', label: 'MySQL Max Query Time (s)', type: 'int' },
+        { key: 'mysql_penalty_enabled', label: 'Bật MySQL Penalty Box', type: 'bool' },
+        { key: 'mysql_penalty_threshold', label: 'Ngưỡng phạt (Số lần Kill)', type: 'int' },
+        { key: 'mysql_penalty_window_sec', label: 'Cửa sổ đếm vi phạm (giây)', type: 'int' },
+        { key: 'mysql_penalty_duration_sec', label: 'Thời gian phạt (giây)', type: 'int' },
+        { key: 'mysql_penalty_conn', label: 'Max Conn khi bị phạt', type: 'int' },
+        { key: 'mysql_penalty_time_sec', label: 'Max Time (s) khi bị phạt', type: 'int' }
+      ];
+
+      function esc(val) {
+        return String(val === undefined || val === null ? '' : val)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;');
+      }
+
+      function showToast(msg, isErr) {
+        const el = document.getElementById('darl-toast');
+        el.textContent = msg;
+        el.className = 'darl-toast ' + (isErr ? 'err' : 'ok');
+        clearTimeout(showToast._t);
+        showToast._t = setTimeout(function () { el.className = 'darl-toast'; }, 6000);
+      }
+
+      async function callAPI(payload, usePost) {
+        const opts = { credentials: 'same-origin' };
+        let url = API_URL;
+        if (usePost) {
+          opts.method = 'POST';
+          opts.headers = { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' };
+          opts.body = 'payload=' + encodeURIComponent(JSON.stringify(payload));
+        } else {
+          const qs = Object.keys(payload).map(function (k) {
+            return encodeURIComponent(k) + '=' + encodeURIComponent(payload[k]);
+          }).join('&');
+          url += '?' + qs;
+        }
+        const res = await fetch(url, opts);
+        return await res.json();
+      }
+
+      function buildFieldsGrid(containerId, prefix) {
+        const box = document.getElementById(containerId);
+        box.innerHTML = LIMIT_FIELDS.map(function (f) {
+          const id = prefix + '-' + f.key;
+          if (f.type === 'bool') {
+            return '<div class="darl-field"><label for="' + id + '">' + esc(f.label) + '</label>' +
+              '<select id="' + id + '" class="darl-select"><option value="true">Bật (Yes)</option><option value="false">Tắt (No)</option></select></div>';
+          }
+          return '<div class="darl-field"><label for="' + id + '">' + esc(f.label) + '</label>' +
+            '<input type="number" id="' + id + '" class="darl-input" /></div>';
+        }).join('');
+      }
+
+      function fillFormLimits(prefix, lim) {
+        LIMIT_FIELDS.forEach(function (f) {
+          const el = document.getElementById(prefix + '-' + f.key);
+          if (!el || !lim) return;
+          el.value = f.type === 'bool' ? (lim[f.key] ? 'true' : 'false') : String(lim[f.key] || 0);
+        });
+      }
+
+      function readFormLimits(prefix) {
+        const out = {};
+        LIMIT_FIELDS.forEach(function (f) {
+          const el = document.getElementById(prefix + '-' + f.key);
+          if (!el) return;
+          out[f.key] = f.type === 'bool' ? (el.value === 'true') : parseInt(el.value || '0', 10);
+        });
+        return out;
+      }
+
+      function pctBar(cur, max) {
+        const pct = max > 0 ? Math.min(100, Math.round((cur / max) * 100)) : 0;
+        const cls = pct >= 90 ? 'crit' : (pct >= 75 ? 'warn' : '');
+        return '<div class="darl-prog"><span class="' + cls + '" style="width:' + pct + '%"></span></div>';
+      }
+
+      async function loadRealtime() {
+        try {
+          const r = await callAPI({ action: 'get_realtime_stats' }, false);
+          const badge = document.getElementById('darl-daemon-badge');
+          if (!r.ok) {
+            badge.className = 'darl-badge darl-badge-err';
+            badge.textContent = 'DAEMON OFFLINE';
+            document.getElementById('mon-tbody').innerHTML =
+              '<tr><td colspan="8" style="color:var(--danger);text-align:center;">' + esc(r.error) + '</td></tr>';
+            return;
+          }
+          const d = r.data.daemon;
+          cachedUsers = r.data.users || [];
+          badge.className = 'darl-badge darl-badge-ok';
+          badge.textContent = 'ONLINE ' + d.version;
+          document.getElementById('darl-daemon-meta').textContent =
+            'Uptime: ' + Math.floor(d.uptime_seconds / 60) + ' phút | Hosting Users: ' + d.managed_users + ' | Active Penalties: ' + d.active_penalties;
+
+          document.getElementById('kpi-users').textContent = String(d.managed_users);
+          document.getElementById('kpi-penalties').textContent = String(d.active_penalties);
+
+          let totalRam = 0;
+          let topCpuUser = '-';
+          let topCpuVal = -1;
+          cachedUsers.forEach(function (u) {
+            totalRam += u.memory_current_mb || 0;
+            if ((u.cpu_percent || 0) > topCpuVal) {
+              topCpuVal = u.cpu_percent || 0;
+              topCpuUser = u.username + ' (' + topCpuVal.toFixed(1) + '%)';
+            }
+          });
+          document.getElementById('kpi-top-cpu').textContent = cachedUsers.length ? topCpuUser : '-';
+          document.getElementById('kpi-total-ram').textContent = totalRam.toFixed(0) + ' MB';
+
+          renderMonitorTable();
+          renderUserSidebar();
+        } catch (e) {
+          showToast('Lỗi kết nối API: ' + e.message, true);
+        }
+      }
+
+      function renderMonitorTable() {
+        const q = (document.getElementById('mon-search').value || '').toLowerCase().trim();
+        const sortBy = document.getElementById('mon-sort').value;
+        const rows = cachedUsers.filter(function (u) {
+          return !q || u.username.toLowerCase().indexOf(q) !== -1 || (u.package || '').toLowerCase().indexOf(q) !== -1;
+        });
+
+        rows.sort(function (a, b) {
+          if (sortBy === 'ram') return (b.memory_current_mb || 0) - (a.memory_current_mb || 0);
+          if (sortBy === 'mysql') return (b.mysql_memory_mb || 0) - (a.mysql_memory_mb || 0);
+          if (sortBy === 'procs') return (b.active_processes || 0) - (a.active_processes || 0);
+          return (b.cpu_percent || 0) - (a.cpu_percent || 0);
+        });
+
+        const tbody = document.getElementById('mon-tbody');
+        if (!rows.length) {
+          tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted);">Không có tài khoản Hosting nào khớp bộ lọc.</td></tr>';
+          return;
+        }
+
+        tbody.innerHTML = rows.map(function (u) {
+          const lim = u.limits || {};
+          let stateBadge = '<span class="darl-badge darl-badge-ok">Bình thường</span>';
+          if (!lim.enabled) {
+            stateBadge = '<span class="darl-badge darl-badge-warn">Tắt giới hạn</span>';
+          } else if (u.penalty_active) {
+            stateBadge = '<span class="darl-badge darl-badge-err">Penalty Throttled</span>';
+          } else if (lim.custom_override) {
+            stateBadge = '<span class="darl-badge darl-badge-info">Custom Override</span>';
+          }
+
+          let actions = '<button type="button" class="darl-btn darl-btn-outline" data-jump-user="' + esc(u.username) + '">Tuỳ chỉnh</button>';
+          if (u.penalty_active) {
+            actions += ' <button type="button" class="darl-btn darl-btn-warn" data-unblock-user="' + esc(u.username) + '">Unblock</button>';
+          }
+
+          return '<tr>' +
+            '<td><strong>' + esc(u.username) + '</strong> <span style="color:var(--muted);font-size:11.5px;">(#' + u.uid + ')</span></td>' +
+            '<td>' + esc(u.package || '-') + '</td>' +
+            '<td>' + (u.cpu_percent || 0).toFixed(1) + '% / ' + (lim.cpu_quota || 0) + '%' + pctBar(u.cpu_percent || 0, lim.cpu_quota || 100) + '</td>' +
+            '<td>' + (u.memory_current_mb || 0).toFixed(1) + ' / ' + (lim.mem_max_mb || 0) + ' MB' + pctBar(u.memory_current_mb || 0, lim.mem_max_mb || 1024) + '</td>' +
+            '<td>' + (u.active_processes || 0) + ' / ' + (lim.tasks_max || 0) + '</td>' +
+            '<td>' + (u.mysql_memory_mb || 0).toFixed(1) + ' / ' + (lim.mysql_max_mem_mb || 0) + ' MB<br/><span style="font-size:11.5px;color:var(--muted);">' +
+              (u.mysql_total_conns || 0) + ' / ' + (lim.mysql_max_connections || 0) + ' conns (' + (u.mysql_active_queries || 0) + ' active)</span></td>' +
+            '<td>' + stateBadge + '</td>' +
+            '<td style="white-space:nowrap;">' + actions + '</td>' +
+          '</tr>';
+        }).join('');
+      }
+
+      async function loadPackages() {
+        const r = await callAPI({ action: 'get_packages' }, false);
+        if (!r.ok) { showToast(r.error || 'Không tải được Package', true); return; }
+        cachedPackages = r.data;
+        const tbody = document.getElementById('pkg-tbody');
+        const list = cachedPackages.packages || [];
+        if (!list.length) {
+          tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted);">Chưa có Hosting Package nào trên DirectAdmin.</td></tr>';
+        } else {
+          tbody.innerHTML = list.map(function (item) {
+            const l = item.limits;
+            return '<tr>' +
+              '<td><strong>' + esc(item.package) + '</strong></td>' +
+              '<td>' + item.user_count + '</td>' +
+              '<td>' + l.cpu_quota + '%</td>' +
+              '<td>' + l.mem_high_mb + ' / ' + l.mem_max_mb + ' MB</td>' +
+              '<td>' + l.php_max_children + ' / ' + l.php_mem_limit_mb + ' MB</td>' +
+              '<td>' + l.mysql_max_connections + ' conn / ' + l.mysql_max_mem_mb + ' MB / ' + l.mysql_max_statement_time_sec + 's</td>' +
+              '<td>' + (item.has_custom_file ? '<span class="darl-badge darl-badge-ok">Đã cấu hình riêng</span>' : '<span class="darl-badge darl-badge-info">Kế thừa Default</span>') + '</td>' +
+              '<td><button type="button" class="darl-btn darl-btn-outline" data-edit-pkg="' + esc(item.package) + '">Chỉnh sửa</button></td>' +
+            '</tr>';
+          }).join('');
+        }
+        selectPackageForEdit('__default__');
+      }
+
+      function selectPackageForEdit(pkgName) {
+        if (!cachedPackages) return;
+        document.getElementById('pkg-edit-target').value = pkgName;
+        if (pkgName === '__default__') {
+          document.getElementById('pkg-form-title').textContent = 'Chỉnh sửa Cấu hình Mặc định (default.conf)';
+          fillFormLimits('pkg', cachedPackages.default_limits);
+          return;
+        }
+        const found = (cachedPackages.packages || []).find(function (p) { return p.package === pkgName; });
+        if (found) {
+          document.getElementById('pkg-form-title').textContent = 'Chỉnh sửa Package: ' + pkgName + ' (' + found.user_count + ' users)';
+          fillFormLimits('pkg', found.limits);
+        }
+      }
+
+      async function savePackageForm(syncUsers) {
+        const target = document.getElementById('pkg-edit-target').value;
+        const limits = readFormLimits('pkg');
+        const payload = target === '__default__'
+          ? { action: 'save_default_limits', sync_users: syncUsers, limits: limits }
+          : { action: 'save_package_limits', package: target, sync_users: syncUsers, limits: limits };
+        const r = await callAPI(payload, true);
+        if (!r.ok) { showToast(r.error, true); return; }
+        showToast(r.message || 'Đã lưu thành công', false);
+        await loadPackages();
+        await loadRealtime();
+      }
+
+      function renderUserSidebar() {
+        const q = (document.getElementById('usr-search').value || '').toLowerCase().trim();
+        const mode = document.getElementById('usr-filter').value;
+        const filtered = cachedUsers.filter(function (u) {
+          if (q && u.username.toLowerCase().indexOf(q) === -1 && (u.package || '').toLowerCase().indexOf(q) === -1) return false;
+          if (mode === 'override' && !(u.limits && u.limits.custom_override)) return false;
+          if (mode === 'penalty' && !u.penalty_active) return false;
+          return true;
+        });
+
+        const listEl = document.getElementById('usr-list');
+        if (!filtered.length) {
+          listEl.innerHTML = '<div style="padding:14px;color:var(--muted);font-size:12.5px;text-align:center;">Không tìm thấy User phù hợp.</div>';
+          return;
+        }
+        listEl.innerHTML = filtered.map(function (u) {
+          const sel = u.username === selectedUsername ? ' selected' : '';
+          let tag = esc(u.package || '-');
+          if (u.penalty_active) tag = '<span class="darl-badge darl-badge-err">Penalty</span>';
+          else if (u.limits && u.limits.custom_override) tag = '<span class="darl-badge darl-badge-info">VIP/Custom</span>';
+          return '<div class="darl-user-item' + sel + '" data-select-user="' + esc(u.username) + '">' +
+            '<span>' + esc(u.username) + '</span><span>' + tag + '</span></div>';
+        }).join('');
+      }
+
+      function selectUserForEdit(username) {
+        selectedUsername = username;
+        renderUserSidebar();
+        const u = cachedUsers.find(function (x) { return x.username === username; });
+        if (!u) return;
+        document.getElementById('usr-empty-hint').style.display = 'none';
+        document.getElementById('usr-editor-wrap').style.display = 'block';
+        document.getElementById('usr-edit-heading').textContent = u.username + ' (UID #' + u.uid + ' | Package: ' + (u.package || 'none') + ')';
+        document.getElementById('usr-edit-sub').textContent =
+          (u.limits && u.limits.custom_override ? 'Đang áp dụng Custom Override riêng' : 'Đang kế thừa tự động từ Package') +
+          ' — Hiện dùng: CPU ' + (u.cpu_percent || 0).toFixed(1) + '%, RAM ' + (u.memory_current_mb || 0).toFixed(1) + 'MB, MySQL ' + (u.mysql_memory_mb || 0).toFixed(1) + 'MB';
+        document.getElementById('btn-usr-unblock').style.display = u.penalty_active ? 'inline-flex' : 'none';
+        fillFormLimits('usr', u.limits);
+      }
+
+      async function loadLogs() {
+        const r = await callAPI({
+          action: 'get_logs',
+          username: document.getElementById('log-user').value.trim(),
+          violation_type: document.getElementById('log-type').value,
+          limit: parseInt(document.getElementById('log-limit').value || '100', 10)
+        }, false);
+        const tbody = document.getElementById('log-tbody');
+        if (!r.ok) {
+          tbody.innerHTML = '<tr><td colspan="5" style="color:var(--danger);text-align:center;">' + esc(r.error) + '</td></tr>';
+          return;
+        }
+        const items = r.data || [];
+        if (!items.length) {
+          tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--muted);">Chưa ghi nhận sự kiện vi phạm nào.</td></tr>';
+          return;
+        }
+        tbody.innerHTML = items.map(function (e) {
+          let badge = '<span class="darl-badge darl-badge-info">' + esc(e.type) + '</span>';
+          if (e.type === 'cgroup_oom_kill') badge = '<span class="darl-badge darl-badge-err">Kernel OOM Killed</span>';
+          else if (e.type === 'mysql_high_memory') badge = '<span class="darl-badge darl-badge-err">MySQL High Memory</span>';
+          else if (e.type === 'mysql_slow_query') badge = '<span class="darl-badge darl-badge-warn">MySQL Slow/Active</span>';
+          else if (e.type === 'mysql_penalty_box') badge = '<span class="darl-badge darl-badge-err">Penalty Throttled</span>';
+
+          const metrics = [];
+          if (e.memory_mb) metrics.push(e.memory_mb.toFixed(1) + ' MB');
+          if (e.duration_ms) metrics.push(e.duration_ms + ' ms');
+
+          return '<tr>' +
+            '<td style="white-space:nowrap;">' + esc(e.timestamp_iso || '') + '</td>' +
+            '<td><a href="#" data-jump-user="' + esc(e.username) + '"><strong>' + esc(e.username) + '</strong></a></td>' +
+            '<td>' + badge + '</td>' +
+            '<td style="white-space:nowrap;">' + esc(metrics.join(' | ') || '-') + '</td>' +
+            '<td><div class="darl-mono">' + esc(e.detail) + '</div></td>' +
+          '</tr>';
+        }).join('');
+      }
+
+      async function loadUpdaterStatus() {
+        const r = await callAPI({ action: 'get_updater_status' }, false);
+        if (!r.ok) { showToast(r.error, true); return; }
+        applyUpdaterData(r.data);
+      }
+
+      function applyUpdaterData(st) {
+        if (!st) return;
+        document.getElementById('upd-cur-ver').textContent = st.current_version || '-';
+        if (st.latest_version) {
+          document.getElementById('upd-latest-ver').textContent = st.latest_version + (st.update_available ? ' (Có bản mới!)' : ' (Mới nhất)');
+        }
+        document.getElementById('upd-token-state').textContent = st.has_token ? ('Đã lưu (' + st.masked_token + ')') : 'Public (Không Token)';
+        document.getElementById('upd-job-state').textContent = st.last_job_state || 'Idle';
+        document.getElementById('upd-repo').value = st.github_repo || 'shostwp-byte/da-resourcelimiter';
+        document.getElementById('upd-channel').value = st.update_channel || 'stable';
+        document.getElementById('upd-retention').value = String(st.backup_retention || 5);
+
+        const notesParts = [];
+        if (st.last_job_message) notesParts.push('[Update Job] ' + st.last_job_message);
+        if (st.release_notes) notesParts.push('--- Release Notes (' + (st.latest_version || '') + ') ---\n' + st.release_notes);
+        if (notesParts.length) {
+          document.getElementById('upd-notes-wrap').style.display = 'block';
+          document.getElementById('upd-notes').textContent = notesParts.join('\n\n');
+        }
+      }
+
+      function switchTab(tab) {
+        activeTab = tab;
+        document.querySelectorAll('#darl-root .darl-tab').forEach(function (btn) {
+          btn.classList.toggle('active', btn.getAttribute('data-tab') === tab);
+        });
+        document.querySelectorAll('#darl-root .darl-panel').forEach(function (p) {
+          p.classList.toggle('active', p.id === 'darl-panel-' + tab);
+        });
+        if (tab === 'packages') loadPackages();
+        else if (tab === 'logs') loadLogs();
+        else if (tab === 'updater') loadUpdaterStatus();
+      }
+
+      // Bindings
+      buildFieldsGrid('pkg-fields-container', 'pkg');
+      buildFieldsGrid('usr-fields-container', 'usr');
+
+      document.querySelectorAll('#darl-root .darl-tab').forEach(function (btn) {
+        btn.addEventListener('click', function () { switchTab(btn.getAttribute('data-tab')); });
+      });
+
+      document.getElementById('darl-btn-refresh').addEventListener('click', function () {
+        loadRealtime();
+        if (activeTab === 'packages') loadPackages();
+        if (activeTab === 'logs') loadLogs();
+        if (activeTab === 'updater') loadUpdaterStatus();
+      });
+
+      document.getElementById('mon-search').addEventListener('input', renderMonitorTable);
+      document.getElementById('mon-sort').addEventListener('change', renderMonitorTable);
+      document.getElementById('usr-search').addEventListener('input', renderUserSidebar);
+      document.getElementById('usr-filter').addEventListener('change', renderUserSidebar);
+
+      document.getElementById('darl-root').addEventListener('click', async function (ev) {
+        const jumpEl = ev.target.closest('[data-jump-user]');
+        if (jumpEl) {
+          ev.preventDefault();
+          const uname = jumpEl.getAttribute('data-jump-user');
+          switchTab('users');
+          selectUserForEdit(uname);
+          return;
+        }
+        const unblockEl = ev.target.closest('[data-unblock-user]');
+        if (unblockEl) {
+          const uname = unblockEl.getAttribute('data-unblock-user');
+          const r = await callAPI({ action: 'unblock_penalty', username: uname }, true);
+          showToast(r.ok ? r.message : r.error, !r.ok);
+          loadRealtime();
+          return;
+        }
+        const editPkgEl = ev.target.closest('[data-edit-pkg]');
+        if (editPkgEl) {
+          selectPackageForEdit(editPkgEl.getAttribute('data-edit-pkg'));
+          return;
+        }
+        const selUserEl = ev.target.closest('[data-select-user]');
+        if (selUserEl) {
+          selectUserForEdit(selUserEl.getAttribute('data-select-user'));
+        }
+      });
+
+      document.getElementById('btn-pkg-save-sync').addEventListener('click', function () { savePackageForm(true); });
+      document.getElementById('btn-pkg-save-only').addEventListener('click', function () { savePackageForm(false); });
+      document.getElementById('btn-pkg-edit-default').addEventListener('click', function () { selectPackageForEdit('__default__'); });
+
+      document.getElementById('btn-usr-save').addEventListener('click', async function () {
+        if (!selectedUsername) return;
+        const r = await callAPI({ action: 'save_user_limits', username: selectedUsername, limits: readFormLimits('usr') }, true);
+        showToast(r.ok ? r.message : r.error, !r.ok);
+        await loadRealtime();
+        selectUserForEdit(selectedUsername);
+      });
+
+      document.getElementById('btn-usr-reset').addEventListener('click', async function () {
+        if (!selectedUsername) return;
+        const r = await callAPI({ action: 'reset_user_limits', username: selectedUsername }, true);
+        showToast(r.ok ? r.message : r.error, !r.ok);
+        await loadRealtime();
+        selectUserForEdit(selectedUsername);
+      });
+
+      document.getElementById('btn-usr-reapply').addEventListener('click', async function () {
+        if (!selectedUsername) return;
+        const r = await callAPI({ action: 'apply_user_limits', username: selectedUsername }, true);
+        showToast(r.ok ? r.message : r.error, !r.ok);
+        await loadRealtime();
+      });
+
+      document.getElementById('btn-usr-unblock').addEventListener('click', async function () {
+        if (!selectedUsername) return;
+        const r = await callAPI({ action: 'unblock_penalty', username: selectedUsername }, true);
+        showToast(r.ok ? r.message : r.error, !r.ok);
+        await loadRealtime();
+        selectUserForEdit(selectedUsername);
+      });
+
+      document.getElementById('btn-log-filter').addEventListener('click', loadLogs);
+
+      document.getElementById('btn-upd-save').addEventListener('click', async function () {
+        const r = await callAPI({
+          action: 'save_updater_config',
+          github_repo: document.getElementById('upd-repo').value.trim(),
+          github_token: document.getElementById('upd-token').value.trim(),
+          keep_stored_token: document.getElementById('upd-keep-token').checked,
+          update_channel: document.getElementById('upd-channel').value,
+          backup_retention: parseInt(document.getElementById('upd-retention').value || '5', 10)
+        }, true);
+        showToast(r.ok ? r.message : r.error, !r.ok);
+        document.getElementById('upd-token').value = '';
+        document.getElementById('upd-keep-token').checked = true;
+        loadUpdaterStatus();
+      });
+
+      document.getElementById('btn-upd-check').addEventListener('click', async function () {
+        const r = await callAPI({ action: 'check_update' }, true);
+        if (!r.ok) { showToast(r.error, true); return; }
+        applyUpdaterData(r.data);
+        showToast(r.data && r.data.update_available ? ('Phát hiện bản mới: ' + r.data.latest_version) : 'Hệ thống đang ở phiên bản mới nhất.', false);
+      });
+
+      document.getElementById('btn-upd-trigger').addEventListener('click', async function () {
+        if (!window.confirm('Xác nhận cập nhật DA-ResourceLimiter từ GitHub Releases? Hệ thống sẽ tự tạo Snapshot Backup (giữ nguyên cấu hình data/) và tự động Rollback nếu bản mới lỗi.')) return;
+        const r = await callAPI({ action: 'trigger_update' }, true);
+        showToast(r.ok ? r.message : r.error, !r.ok);
+        setTimeout(loadUpdaterStatus, 2500);
+      });
+
+      document.getElementById('btn-upd-rollback').addEventListener('click', async function () {
+        if (!window.confirm('Khôi phục ngay phiên bản từ bản Snapshot Backup gần nhất?')) return;
+        const r = await callAPI({ action: 'rollback_update' }, true);
+        showToast(r.ok ? r.message : r.error, !r.ok);
+        setTimeout(loadUpdaterStatus, 2500);
+      });
+
+      loadRealtime();
+      setInterval(function () {
+        if (document.getElementById('darl-autorefresh').checked && activeTab === 'monitor') {
+          loadRealtime();
+        }
+      }, 5000);
+    })();
+  </script>
+</div>
+DARL_ADMIN_HTML

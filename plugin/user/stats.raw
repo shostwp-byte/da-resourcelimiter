@@ -1,0 +1,10 @@
+#!/bin/sh
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+for candidate in /usr/local/bin/php /usr/bin/php /usr/local/php84/bin/php /usr/local/php83/bin/php /usr/local/php82/bin/php /usr/local/php81/bin/php; do
+    if [ -x "$candidate" ]; then
+        exec "$candidate" -n "${SCRIPT_DIR}/stats.php"
+    fi
+done
+
+printf "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json; charset=utf-8\r\n\r\n"
+printf '{"ok":false,"error":"PHP CLI binary not found on DirectAdmin host"}\n'

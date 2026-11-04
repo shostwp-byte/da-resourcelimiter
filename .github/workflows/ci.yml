@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build-and-test:
-    name: Build, Test & Verify Static Binaries
+    name: Build, Test & Lint (Go + Shell + PHP)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -43,10 +43,12 @@ jobs:
           file dist/da-resourced-linux-amd64
           file dist/da-resourced-linux-arm64
 
-      - name: Lint shell scripts (if present)
+      - name: Lint shell & CGI wrapper scripts (ShellCheck)
         run: |
           shopt -s globstar nullglob
-          files=(scripts/**/*.sh)
-          if [ ${#files[@]} -gt 0 ]; then
-            shellcheck "${files[@]}"
-          fi
+          shellcheck scripts/**/*.sh plugin/admin/api.raw plugin/user/stats.raw plugin/admin/index.html plugin/user/index.html
+
+      - name: Lint PHP endpoints
+        run: |
+          php -l plugin/admin/api.php
+          php -l plugin/user/stats.php

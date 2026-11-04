@@ -88,14 +88,11 @@ func (e *Engine) ApplyUser(ctx context.Context, username string) error {
 	if err := config.ValidateIdentifier(username); err != nil {
 		return err
 	}
+	// Always reload registry so recent package changes or newly created users in DirectAdmin take effect immediately
+	_ = e.Registry.Reload()
 	acct, ok := e.Registry.LookupByName(username)
 	if !ok {
-		// Refresh registry in case DirectAdmin just created this user milliseconds ago
-		_ = e.Registry.Reload()
-		acct, ok = e.Registry.LookupByName(username)
-		if !ok {
-			return fmt.Errorf("DirectAdmin hosting user %q not found", username)
-		}
+		return fmt.Errorf("DirectAdmin hosting user %q not found", username)
 	}
 
 	limits, err := e.Store.ResolveUserLimits(acct.Username, acct.Package)
