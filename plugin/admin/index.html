@@ -399,13 +399,13 @@ cat <<'DARL_ADMIN_HTML'
         showToast._t = setTimeout(function () { el.className = 'darl-toast'; }, 6000);
       }
 
-      function encodeUTF8Base64(str) {
+      function encodeUTF8Base64Url(str) {
         const bytes = new TextEncoder().encode(str);
         let bin = '';
         for (let i = 0; i < bytes.length; i++) {
           bin += String.fromCharCode(bytes[i]);
         }
-        return btoa(bin);
+        return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
       }
 
       async function callAPI(payload, usePost) {
@@ -414,8 +414,7 @@ cat <<'DARL_ADMIN_HTML'
         if (usePost) {
           opts.method = 'POST';
           opts.headers = { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' };
-          opts.body = 'payload_b64=' + encodeURIComponent(encodeUTF8Base64(JSON.stringify(payload)));
-          url += '?pipe_post=yes';
+          opts.body = 'payload_b64=' + encodeUTF8Base64Url(JSON.stringify(payload));
         } else {
           const qs = Object.keys(payload).map(function (k) {
             return encodeURIComponent(k) + '=' + encodeURIComponent(payload[k]);

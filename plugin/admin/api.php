@@ -39,33 +39,48 @@ function read_da_request(bool &$detectedPost): array
         if ($trimPost !== '' && ($trimPost[0] === '{' || $trimPost[0] === '[')) {
             $decoded = json_decode($trimPost, true);
             if (is_array($decoded)) {
-                return array_merge($params, $decoded);
+                return normalize_ipc_payload(array_merge($params, $decoded));
             }
         }
         parse_str($cleanPost, $postParams);
         if (is_array($postParams)) {
             $params = array_merge($params, $postParams);
         }
-    } else {
-        $rawStdin = @file_get_contents('php://input', false, null, 0, 65536);
-        if (is_string($rawStdin) && $rawStdin !== '') {
-            $detectedPost = true;
-            $trimRaw = trim($rawStdin);
-            if ($trimRaw !== '' && ($trimRaw[0] === '{' || $trimRaw[0] === '[')) {
-                $decoded = json_decode($trimRaw, true);
-                if (is_array($decoded)) {
-                    return array_merge($params, $decoded);
+    } elseif (defined('STDIN') && is_resource(STDIN)) {
+        $reqMeth = strtoupper((string) (getenv('REQUEST_METHOD') ?: ''));
+        $cLen = (int) (getenv('CONTENT_LENGTH') ?: 0);
+        $waitUsec = ($reqMeth === 'POST' || $cLen > 0) ? 200000 : 0;
+        $readStreams = [STDIN];
+        $writeStreams = null;
+        $exceptStreams = null;
+        if (@stream_select($readStreams, $writeStreams, $exceptStreams, 0, $waitUsec) > 0) {
+            @stream_set_blocking(STDIN, false);
+            $maxBytes = ($cLen > 0 && $cLen <= 65536) ? $cLen : 65536;
+            $rawStdin = @stream_get_contents(STDIN, $maxBytes);
+            if (is_string($rawStdin) && trim($rawStdin) !== '') {
+                $detectedPost = true;
+                $trimRaw = trim($rawStdin);
+                if ($trimRaw[0] === '{' || $trimRaw[0] === '[') {
+                    $decoded = json_decode($trimRaw, true);
+                    if (is_array($decoded)) {
+                        return normalize_ipc_payload(array_merge($params, $decoded));
+                    }
                 }
-            }
-            parse_str($rawStdin, $stdinParams);
-            if (is_array($stdinParams)) {
-                $params = array_merge($params, $stdinParams);
+                parse_str($rawStdin, $stdinParams);
+                if (is_array($stdinParams)) {
+                    $params = array_merge($params, $stdinParams);
+                }
             }
         }
     }
 
     if (isset($params['payload_b64']) && is_string($params['payload_b64'])) {
-        $rawJson = base64_decode($params['payload_b64'], true);
+        $b64 = strtr(trim($params['payload_b64']), '-_ ', '+/+');
+        $rem = strlen($b64) % 4;
+        if ($rem > 0) {
+            $b64 .= str_repeat('=', 4 - $rem);
+        }
+        $rawJson = base64_decode($b64, true);
         if (is_string($rawJson) && $rawJson !== '') {
             $decoded = json_decode($rawJson, true);
             if (is_array($decoded)) {
@@ -107,15 +122,17 @@ function normalize_ipc_payload(array $params): array
     }
 
     if (isset($params['limits']) && is_array($params['limits'])) {
-        foreach (['enabled', 'custom_override'] as $bKey) {
+        foreach (['enabled', 'custom_override', 'mysql_penalty_enabled'] as $bKey) {
             if (isset($params['limits'][$bKey]) && !is_bool($params['limits'][$bKey])) {
                 $params['limits'][$bKey] = filter_var($params['limits'][$bKey], FILTER_VALIDATE_BOOLEAN);
             }
         }
         $limitIntKeys = [
             'cpu_quota',
+            'cpu_weight',
             'mem_high_mb',
             'mem_max_mb',
+            'io_weight',
             'tasks_max',
             'php_max_children',
             'php_mem_limit_mb',
@@ -123,6 +140,11 @@ function normalize_ipc_payload(array $params): array
             'mysql_max_statement_time_sec',
             'mysql_max_mem_mb',
             'mysql_max_active_queries',
+            'mysql_penalty_threshold',
+            'mysql_penalty_window_sec',
+            'mysql_penalty_duration_sec',
+            'mysql_penalty_conn',
+            'mysql_penalty_time_sec',
         ];
         foreach ($limitIntKeys as $iKey) {
             if (isset($params['limits'][$iKey]) && !is_int($params['limits'][$iKey])) {
@@ -159,18 +181,30 @@ $mutatingActions = [
 
 $detectedPost = false;
 $input = read_da_request($detectedPost);
-$action = isset($input['action']) && is_string($input['action']) ? trim($input['action']) : 'ping';
+unset($input['pipe_post']);
+
+$envMethod = strtoupper((string) (getenv('REQUEST_METHOD') ?: ''));
+$isPost = ($envMethod === 'POST') || $detectedPost;
+
+$action = '';
+if (isset($input['action']) && is_string($input['action'])) {
+    $action = trim($input['action']);
+} elseif (!$isPost && empty($input)) {
+    $action = 'ping';
+}
+
+if ($action === '') {
+    emit_json(['ok' => false, 'error' => 'Empty request payload received by DirectAdmin CGI relay'], 400);
+}
+$input['action'] = $action;
 
 if (!isset($readOnlyActions[$action]) && !isset($mutatingActions[$action])) {
     emit_json(['ok' => false, 'error' => "Unsupported admin action: {$action}"], 400);
 }
 
-$envMethod = strtoupper((string) (getenv('REQUEST_METHOD') ?: ''));
-$isPost = ($envMethod === 'POST') || $detectedPost || (isset($input['pipe_post']) && $input['pipe_post'] === 'yes' && $envMethod === '');
 if (isset($mutatingActions[$action]) && !$isPost) {
     emit_json(['ok' => false, 'error' => 'Mutating actions require HTTP POST'], 405);
 }
-unset($input['pipe_post']);
 
 $sockPath = getenv('DA_LIMITER_ADMIN_SOCK') ?: '/var/run/da-resourced.sock';
 $errno = 0;
