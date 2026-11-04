@@ -75,6 +75,74 @@ detect_arch() {
     esac
 }
 
+extract_asset_api_url() {
+    local json_file="$1"
+    local target_name="$2"
+    local found=""
+
+    if command -v python3 >/dev/null 2>&1; then
+        found=$(python3 - "$json_file" "$target_name" <<'PY' 2>/dev/null || true
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+for asset in data.get("assets", []):
+    if asset.get("name") == sys.argv[2]:
+        print(asset.get("url", ""))
+        break
+PY
+)
+    fi
+
+    if [[ -z "$found" ]] && command -v php >/dev/null 2>&1; then
+        # shellcheck disable=SC2016
+        found=$(php -n -r '
+            $d = json_decode(file_get_contents($argv[1]), true);
+            foreach (($d["assets"] ?? []) as $a) {
+                if (($a["name"] ?? "") === $argv[2]) { echo $a["url"] ?? ""; break; }
+            }
+        ' "$json_file" "$target_name" 2>/dev/null || true)
+    fi
+
+    if [[ -z "$found" ]]; then
+        found=$(tr -d '\r\n' < "$json_file" \
+            | grep -oE '\{"url":"https://[^"]+/releases/assets/[0-9]+"[^}]*"name":"'"${target_name}"'"' \
+            | grep -oE 'https://[^"]+/releases/assets/[0-9]+' \
+            | head -n 1 || true)
+    fi
+
+    printf '%s' "$found"
+}
+
+download_github_asset() {
+    local asset_api_url="$1"
+    local dest_file="$2"
+
+    if [[ -z "$GITHUB_TOKEN" ]]; then
+        curl -fsSL \
+            -H "Accept: application/octet-stream" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$asset_api_url" -o "$dest_file"
+        return 0
+    fi
+
+    # For Private Repositories: GitHub Asset API responds with HTTP 302 to signed CDN storage.
+    # Strip Authorization header before following the cross-host redirect to avoid S3/Azure HTTP 400.
+    local hdr_file="${dest_file}.headers"
+    curl -fsS \
+        -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+        -H "Accept: application/octet-stream" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        -D "$hdr_file" -o "$dest_file" "$asset_api_url" || true
+
+    local redirect_url=""
+    redirect_url=$(awk 'tolower($1) == "location:" { sub(/\r$/, "", $2); print $2 }' "$hdr_file" | tail -n 1)
+    rm -f "$hdr_file"
+
+    if [[ -n "$redirect_url" ]]; then
+        curl -fsSL "$redirect_url" -o "$dest_file"
+    fi
+}
+
 bootstrap_from_github() {
     local arch="$1"
     local work_dir="$2"
@@ -99,18 +167,17 @@ bootstrap_from_github() {
         -H "X-GitHub-Api-Version: 2022-11-28" \
         "$api_url" -o "$rel_json"
 
-    # Extract asset API URLs without requiring jq on minimal OS installs
     local archive_asset_url checksum_asset_url
-    archive_asset_url=$(grep -B 4 "\"name\": *\"${archive_name}\"" "$rel_json" | grep '"url":' | head -n 1 | sed -E 's/.*"url": *"([^"]+)".*/\1/')
-    checksum_asset_url=$(grep -B 4 '"name": *"checksums.txt"' "$rel_json" | grep '"url":' | head -n 1 | sed -E 's/.*"url": *"([^"]+)".*/\1/')
+    archive_asset_url=$(extract_asset_api_url "$rel_json" "$archive_name")
+    checksum_asset_url=$(extract_asset_api_url "$rel_json" "checksums.txt")
 
     if [[ -z "$archive_asset_url" || -z "$checksum_asset_url" ]]; then
         fatal "Could not locate ${archive_name} or checksums.txt in GitHub Release."
     fi
 
     info "Downloading checksums.txt & ${archive_name}..."
-    curl -fsSL "${curl_auth[@]}" -H "Accept: application/octet-stream" "$checksum_asset_url" -o "${work_dir}/checksums.txt"
-    curl -fsSL "${curl_auth[@]}" -H "Accept: application/octet-stream" "$archive_asset_url" -o "${work_dir}/${archive_name}"
+    download_github_asset "$checksum_asset_url" "${work_dir}/checksums.txt"
+    download_github_asset "$archive_asset_url" "${work_dir}/${archive_name}"
 
     info "Verifying SHA-256 signature..."
     (
@@ -130,13 +197,25 @@ install_from_bundle() {
     mv -f "${BIN_DEST}.new" "$BIN_DEST"
 
     info "Deploying DirectAdmin Plugin files to ${PLUGIN_DEST}..."
-    mkdir -p "$PLUGIN_DEST" "${PLUGIN_DEST}/scripts" "${PLUGIN_DEST}/data/packages" "${PLUGIN_DEST}/data/users"
+    mkdir -p "$PLUGIN_DEST" "${PLUGIN_DEST}/images" "${PLUGIN_DEST}/scripts" "${PLUGIN_DEST}/data/packages" "${PLUGIN_DEST}/data/users"
 
     local sub
     for sub in admin user hooks images templates; do
-        rm -rf "${PLUGIN_DEST:?}/${sub}"
-        cp -a "${bundle_dir}/plugin/${sub}" "${PLUGIN_DEST}/${sub}"
+        if [[ -d "${bundle_dir}/plugin/${sub}" ]]; then
+            rm -rf "${PLUGIN_DEST:?}/${sub}"
+            cp -a "${bundle_dir}/plugin/${sub}" "${PLUGIN_DEST}/${sub}"
+        fi
     done
+
+    # Sync latest Evolution Skin Monitor SVG icons if release bundle predates plugin/images/
+    if [[ ! -f "${PLUGIN_DEST}/images/admin_icon.svg" ]]; then
+        local raw_auth=()
+        [[ -n "$GITHUB_TOKEN" ]] && raw_auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+        curl -fsSL "${raw_auth[@]}" "https://raw.githubusercontent.com/${GITHUB_REPO}/main/plugin/images/admin_icon.svg" -o "${PLUGIN_DEST}/images/admin_icon.svg" 2>/dev/null || true
+        curl -fsSL "${raw_auth[@]}" "https://raw.githubusercontent.com/${GITHUB_REPO}/main/plugin/images/user_icon.svg" -o "${PLUGIN_DEST}/images/user_icon.svg" 2>/dev/null || true
+        curl -fsSL "${raw_auth[@]}" "https://raw.githubusercontent.com/${GITHUB_REPO}/main/plugin/hooks/admin_img.html" -o "${PLUGIN_DEST}/hooks/admin_img.html" 2>/dev/null || true
+        curl -fsSL "${raw_auth[@]}" "https://raw.githubusercontent.com/${GITHUB_REPO}/main/plugin/hooks/user_img.html" -o "${PLUGIN_DEST}/hooks/user_img.html" 2>/dev/null || true
+    fi
     cp -a "${bundle_dir}/plugin/plugin.conf" "${PLUGIN_DEST}/plugin.conf"
     cp -a "${bundle_dir}/plugin/data/default.conf.example" "${PLUGIN_DEST}/data/default.conf.example"
 
@@ -223,7 +302,8 @@ EOF
     info "Enabling & starting systemd service da-resourced.service..."
     install -o root -g root -m 0644 "${bundle_dir}/systemd/da-resourced.service" "$SYSTEMD_UNIT"
     systemctl daemon-reload
-    systemctl enable --now da-resourced
+    systemctl enable da-resourced
+    systemctl restart da-resourced
 
     local ok_ping="no"
     for _ in 1 2 3 4 5 6 7 8; do
