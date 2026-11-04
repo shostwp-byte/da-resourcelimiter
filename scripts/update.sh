@@ -90,8 +90,7 @@ install_da_hooks() {
 }
 
 healthcheck_daemon() {
-    local attempt
-    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
         if systemctl is-active --quiet da-resourced && "$BIN_DEST" ping >/dev/null 2>&1; then
             return 0
         fi

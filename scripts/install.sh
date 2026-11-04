@@ -218,8 +218,7 @@ EOF
     systemctl enable --now da-resourced
 
     local ok_ping="no"
-    local i
-    for i in 1 2 3 4 5 6 7 8; do
+    for _ in 1 2 3 4 5 6 7 8; do
         if "$BIN_DEST" ping >/dev/null 2>&1; then
             ok_ping="yes"
             break

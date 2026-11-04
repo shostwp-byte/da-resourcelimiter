@@ -43,25 +43,25 @@ function read_da_request(): array
         }
     } else {
         $len = (int) (getenv('CONTENT_LENGTH') ?: 0);
-        if $len > 0 && $len <= 65536 {
+        if ($len > 0 && $len <= 65536) {
             $rawStdin = stream_get_contents(STDIN, $len);
-            if is_string($rawStdin) && $rawStdin !== '' {
+            if (is_string($rawStdin) && $rawStdin !== '') {
                 $trimRaw = trim($rawStdin);
-                if $trimRaw !== '' && $trimRaw[0] === '{' {
+                if ($trimRaw !== '' && ($trimRaw[0] === '{' || $trimRaw[0] === '[')) {
                     $decoded = json_decode($trimRaw, true);
-                    if is_array($decoded)) {
+                    if (is_array($decoded)) {
                         return array_merge($params, $decoded);
                     }
                 }
                 parse_str($rawStdin, $stdinParams);
-                if is_array($stdinParams)) {
+                if (is_array($stdinParams)) {
                     $params = array_merge($params, $stdinParams);
                 }
             }
         }
     }
 
-    if isset($params['payload']) && is_string($params['payload'])) {
+    if (isset($params['payload']) && is_string($params['payload'])) {
         $decoded = json_decode($params['payload'], true);
         if (is_array($decoded)) {
             unset($params['payload']);
