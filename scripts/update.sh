@@ -48,6 +48,12 @@ fix_permissions() {
             "${PLUGIN_DEST}/hooks" \
             "${PLUGIN_DEST}/templates" \
             "${PLUGIN_DEST}/data" 2>/dev/null || true
+
+        # Ensure DirectAdmin user.conf files strictly retain diradmin:diradmin (0600) ownership
+        if [[ -d "/usr/local/directadmin/data/users" ]]; then
+            chown diradmin:diradmin /usr/local/directadmin/data/users/*/user.conf 2>/dev/null || true
+            chmod 0600 /usr/local/directadmin/data/users/*/user.conf 2>/dev/null || true
+        fi
     fi
     chmod 0755 \
         "${PLUGIN_DEST}/admin/index.html" \

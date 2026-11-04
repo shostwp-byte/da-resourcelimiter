@@ -5,7 +5,7 @@ import "fmt"
 const DefaultGitHubRepo = "shostwp-byte/da-resourcelimiter"
 
 var (
-	Version   = "v1.0.3"
+	Version   = "v1.0.4"
 	Commit    = "none"
 	BuildTime = "unknown"
 )

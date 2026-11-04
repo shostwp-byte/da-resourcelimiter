@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/shostwp-byte/da-resourcelimiter/internal/cgroup"
@@ -166,7 +167,8 @@ func writePIDToCgroupProcs(procsPath, pid string) error {
 }
 
 // SyncDAUserPHPConf updates DA_PHP_MAX_CHILDREN and DA_PHP_MEM_LIMIT tokens inside
-// /usr/local/directadmin/data/users/<username>/user.conf while preserving all other fields.
+// /usr/local/directadmin/data/users/<username>/user.conf while strictly preserving
+// DirectAdmin's required diradmin:diradmin (0600) ownership and all other fields.
 func SyncDAUserPHPConf(daUsersDir, username string, limits config.ResourceLimits) error {
 	if err := config.ValidateIdentifier(username); err != nil {
 		return err
@@ -174,9 +176,10 @@ func SyncDAUserPHPConf(daUsersDir, username string, limits config.ResourceLimits
 	if daUsersDir == "" {
 		daUsersDir = "/usr/local/directadmin/data/users"
 	}
-	userConf := filepath.Join(daUsersDir, username, "user.conf")
+	userDir := filepath.Join(daUsersDir, username)
+	userConf := filepath.Join(userDir, "user.conf")
 
-	f, err := os.Open(userConf)
+	rawBytes, err := os.ReadFile(userConf)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -184,8 +187,27 @@ func SyncDAUserPHPConf(daUsersDir, username string, limits config.ResourceLimits
 		return err
 	}
 
+	curUID, curGID, curMode, hasStat := statOwnerAndMode(userConf)
+	if curMode == 0 {
+		curMode = 0o600
+	}
+
+	// Determine authoritative DirectAdmin ownership (diradmin:diradmin) when running as root
+	// so daemon never leaves user.conf owned by root:root (which causes "Unable to show user" in DA).
+	targetUID, targetGID := -1, -1
+	if os.Geteuid() == 0 {
+		targetUID, targetGID = lookupAccountUIDGID("/etc/passwd", "diradmin")
+		if targetUID < 0 {
+			if dirUID, dirGID, _, dirOK := statOwnerAndMode(userDir); dirOK && dirUID > 0 {
+				targetUID, targetGID = dirUID, dirGID
+			} else if hasStat {
+				targetUID, targetGID = curUID, curGID
+			}
+		}
+	}
+
 	var keptLines []string
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(strings.NewReader(string(rawBytes)))
 	for scanner.Scan() {
 		line := scanner.Text()
 		trimmed := strings.TrimSpace(line)
@@ -194,9 +216,7 @@ func SyncDAUserPHPConf(daUsersDir, username string, limits config.ResourceLimits
 		}
 		keptLines = append(keptLines, line)
 	}
-	scanErr := scanner.Err()
-	_ = f.Close()
-	if scanErr != nil {
+	if scanErr := scanner.Err(); scanErr != nil {
 		return scanErr
 	}
 
@@ -208,9 +228,50 @@ func SyncDAUserPHPConf(daUsersDir, username string, limits config.ResourceLimits
 	}
 
 	out := strings.Join(keptLines, "\n") + "\n"
+
+	// Avoid unnecessary disk writes if content is already identical, while still self-healing
+	// ownership if a prior version left user.conf owned by root:root.
+	if out == string(rawBytes) {
+		if targetUID >= 0 && targetGID >= 0 && hasStat && (curUID != targetUID || curGID != targetGID) {
+			_ = os.Chown(userConf, targetUID, targetGID)
+		}
+		return nil
+	}
+
 	tmp := userConf + ".da-limiter.tmp"
-	if err := os.WriteFile(tmp, []byte(out), 0o600); err != nil {
+	if err := os.WriteFile(tmp, []byte(out), curMode); err != nil {
 		return err
 	}
-	return os.Rename(tmp, userConf)
+	if targetUID >= 0 && targetGID >= 0 {
+		if err := os.Chown(tmp, targetUID, targetGID); err != nil {
+			_ = os.Remove(tmp)
+			return fmt.Errorf("chown %s to diradmin (%d:%d): %w", tmp, targetUID, targetGID, err)
+		}
+	}
+	if err := os.Rename(tmp, userConf); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+func lookupAccountUIDGID(passwdPath, username string) (int, int) {
+	f, err := os.Open(passwdPath)
+	if err != nil {
+		return -1, -1
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		parts := strings.Split(sc.Text(), ":")
+		if len(parts) >= 4 && parts[0] == username {
+			uid, err1 := strconv.Atoi(parts[2])
+			gid, err2 := strconv.Atoi(parts[3])
+			if err1 == nil && err2 == nil {
+				return uid, gid
+			}
+		}
+	}
+	return -1, -1
 }

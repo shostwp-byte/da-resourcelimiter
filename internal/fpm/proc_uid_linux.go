@@ -19,3 +19,15 @@ func statUID(path string) (uint32, error) {
 	}
 	return st.Uid, nil
 }
+
+func statOwnerAndMode(path string) (uid int, gid int, mode os.FileMode, ok bool) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return -1, -1, 0o600, false
+	}
+	st, castOK := info.Sys().(*syscall.Stat_t)
+	if !castOK {
+		return -1, -1, info.Mode().Perm(), false
+	}
+	return int(st.Uid), int(st.Gid), info.Mode().Perm(), true
+}

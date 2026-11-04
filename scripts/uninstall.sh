@@ -67,10 +67,22 @@ if command -v mysql >/dev/null 2>&1 && [[ -f "$DA_MYCNF" ]] && [[ -d "/usr/local
     shopt -u nullglob
 fi
 
-info "Removing DirectAdmin lifecycle hook entries..."
+info "Removing DirectAdmin lifecycle hook entries & restoring user.conf PHP tokens..."
 for hook_folder in user_create_post user_modify_post user_destroy_post database_create_post database_user_create_post package_write_post; do
     rm -f "${DA_CUSTOM_HOOKS}/${hook_folder}/da_resource_limiter.sh"
 done
+
+if [[ -d "/usr/local/directadmin/data/users" ]]; then
+    shopt -s nullglob
+    for uconf in /usr/local/directadmin/data/users/*/user.conf; do
+        sed -i '/^DA_PHP_MAX_CHILDREN=/d;/^DA_PHP_MEM_LIMIT=/d' "$uconf" 2>/dev/null || true
+        if id diradmin >/dev/null 2>&1; then
+            chown diradmin:diradmin "$uconf" 2>/dev/null || true
+        fi
+        chmod 0600 "$uconf" 2>/dev/null || true
+    done
+    shopt -u nullglob
+fi
 
 if [[ -d "${PLUGIN_DEST}/data" ]]; then
     mkdir -p "$BACKUP_DIR"
