@@ -116,6 +116,8 @@ type PingData struct {
 	UptimeSeconds   int64  `json:"uptime_seconds"`
 	ManagedUsers    int    `json:"managed_users"`
 	ActivePenalties int    `json:"active_penalties"`
+	SyncInProgress  bool   `json:"sync_in_progress,omitempty"`
+	SyncLabel       string `json:"sync_label,omitempty"`
 }
 
 // UserUsageSnapshot combines real-time Cgroups v2 and MariaDB resource usage for a single DirectAdmin user.
@@ -183,6 +185,7 @@ type UpdaterStatusData struct {
 	RepoPinned        bool   `json:"repo_pinned"`
 	SignatureRequired bool   `json:"signature_required"`
 	RootOnlyActions   bool   `json:"root_only_actions"`
+	CanManageUpdater  bool   `json:"can_manage_updater"`
 	HasToken          bool   `json:"has_token"`
 	MaskedToken       string `json:"masked_token"`
 	UpdateChannel     string `json:"update_channel"`

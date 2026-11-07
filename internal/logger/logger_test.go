@@ -91,4 +91,22 @@ func TestMultiChunkReverseTailReadAndTimestampCutoff(t *testing.T) {
 	if oomCount != 40 {
 		t.Fatalf("expected 40 entries with ts >= baseTS+201, got %d", oomCount)
 	}
+
+	// Verify N16: querying a user ("bob") with 0 entries stops at minTimestampUnix AND invalidates 3s cache on new Log()!
+	bobOOM, bobSQL, _ := vlog.CountSince("bob", baseTS+235)
+	if bobOOM != 0 || bobSQL != 0 {
+		t.Fatalf("expected 0 entries for bob, got oom=%d sql=%d", bobOOM, bobSQL)
+	}
+	if err := vlog.Log(ipc.ViolationEntry{
+		TimestampUnix: baseTS + 241,
+		Username:      "bob",
+		Type:          TypeMySQLSlowQuery,
+		Detail:        "SELECT SLEEP(20)",
+	}); err != nil {
+		t.Fatalf("Log bob: %v", err)
+	}
+	_, bobSQLAfter, _ := vlog.CountSince("bob", baseTS+235)
+	if bobSQLAfter != 1 {
+		t.Fatalf("expected CountSince cache invalidation on Log() to return 1 for bob (N16), got %d", bobSQLAfter)
+	}
 }

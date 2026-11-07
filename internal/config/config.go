@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/shostwp-byte/da-resourcelimiter/internal/version"
 )
@@ -76,10 +78,31 @@ func DefaultLimits() ResourceLimits {
 	}
 }
 
+// ClampPenaltyUpperBounds clamps MySQL Penalty Box caps so they never exceed the normal
+// MySQL connection / statement-time ceilings when loading upgraded or legacy configs (N3).
+// Note: values <= 0 are intentionally NOT clamped so R2 validation still catches 0 ("unlimited").
+func (r ResourceLimits) ClampPenaltyUpperBounds() (ResourceLimits, []string) {
+	out := r
+	var notes []string
+	if out.MySQLMaxConnections >= 1 && out.MySQLPenaltyConn > out.MySQLMaxConnections {
+		notes = append(notes, fmt.Sprintf("MYSQL_PENALTY_CONN (%d) clamped to MYSQL_MAX_CONNECTIONS (%d)", out.MySQLPenaltyConn, out.MySQLMaxConnections))
+		out.MySQLPenaltyConn = out.MySQLMaxConnections
+	}
+	if out.MySQLMaxStatementTime >= 1 && out.MySQLPenaltyTimeSec > out.MySQLMaxStatementTime {
+		notes = append(notes, fmt.Sprintf("MYSQL_PENALTY_TIME_SEC (%d) clamped to MYSQL_MAX_STATEMENT_TIME_SEC (%d)", out.MySQLPenaltyTimeSec, out.MySQLMaxStatementTime))
+		out.MySQLPenaltyTimeSec = out.MySQLMaxStatementTime
+	}
+	return out, notes
+}
+
 // Validate checks bounds and cross-field constraints (including MySQL Penalty Box bounds)
 // before applying limits to Kernel or MariaDB. Note: 0 is rejected for penalty conn/time
-// because MariaDB interprets 0 as "unlimited" (R2).
+// because MariaDB interprets 0 as "unlimited" (R2). When Enabled is false, validation is
+// skipped so admins can always disable a user or package without being blocked by legacy values (N3).
 func (r ResourceLimits) Validate() error {
+	if !r.Enabled {
+		return nil
+	}
 	if r.CPUQuota < 10 || r.CPUQuota > 12800 {
 		return fmt.Errorf("CPU_QUOTA must be between 10 and 12800 (got %d)", r.CPUQuota)
 	}
@@ -206,6 +229,8 @@ func ParseKeyValueFile(path string) (map[string]string, error) {
 
 	kv := make(map[string]string)
 	scanner := bufio.NewScanner(f)
+	// Allow lines up to 1 MB so DirectAdmin user.conf files with long domain/token lists never fail with ErrTooLong (N2).
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
@@ -332,12 +357,33 @@ func FormatLimits(r ResourceLimits) string {
 type Store struct {
 	DataDir        string
 	UpdaterCfgPath string
+
+	warnMu       sync.Mutex
+	warnedClamps map[string]string
 }
 
 func NewStore(dataDir, updaterCfgPath string) *Store {
 	return &Store{
 		DataDir:        dataDir,
 		UpdaterCfgPath: updaterCfgPath,
+		warnedClamps:   make(map[string]string),
+	}
+}
+
+func (s *Store) logClampOnce(scope string, notes []string) {
+	if len(notes) == 0 {
+		return
+	}
+	summary := strings.Join(notes, "; ")
+	s.warnMu.Lock()
+	if s.warnedClamps == nil {
+		s.warnedClamps = make(map[string]string)
+	}
+	already := s.warnedClamps[scope] == summary
+	s.warnedClamps[scope] = summary
+	s.warnMu.Unlock()
+	if !already {
+		log.Printf("warning: clamped legacy penalty limits for %s: %s", scope, summary)
 	}
 }
 
@@ -359,8 +405,8 @@ func (s *Store) UserConfPath(username string) (string, error) {
 	return filepath.Join(s.DataDir, "users", username+".conf"), nil
 }
 
-// ResolveUserLimits resolves effective limits using Default -> Package -> User Override hierarchy
-// and validates all fields (including MySQL Penalty bounds) before returning (R2).
+// ResolveUserLimits resolves effective limits using Default -> Package -> User Override hierarchy,
+// clamps legacy penalty ceilings that exceed normal ceilings (N3), and validates all fields (R2).
 func (s *Store) ResolveUserLimits(username, packageName string) (ResourceLimits, error) {
 	limits := DefaultLimits()
 
@@ -391,13 +437,25 @@ func (s *Store) ResolveUserLimits(username, packageName string) (ResourceLimits,
 		return limits, fmt.Errorf("read user %s: %w", username, err)
 	}
 
+	var notes []string
+	limits, notes = limits.ClampPenaltyUpperBounds()
+	s.logClampOnce("user:"+username, notes)
+
 	if err := limits.Validate(); err != nil {
 		return limits, fmt.Errorf("invalid resolved limits for %q: %w", username, err)
 	}
 	return limits, nil
 }
 
+func normalizeForSave(r ResourceLimits) ResourceLimits {
+	if !r.MySQLPenaltyEnabled {
+		r, _ = r.ClampPenaltyUpperBounds()
+	}
+	return r
+}
+
 func (s *Store) SaveDefaultLimits(r ResourceLimits) error {
+	r = normalizeForSave(r)
 	if err := r.Validate(); err != nil {
 		return err
 	}
@@ -405,6 +463,7 @@ func (s *Store) SaveDefaultLimits(r ResourceLimits) error {
 }
 
 func (s *Store) SavePackageLimits(pkg string, r ResourceLimits) error {
+	r = normalizeForSave(r)
 	if err := r.Validate(); err != nil {
 		return err
 	}
@@ -416,6 +475,7 @@ func (s *Store) SavePackageLimits(pkg string, r ResourceLimits) error {
 }
 
 func (s *Store) SaveUserLimits(username string, r ResourceLimits) error {
+	r = normalizeForSave(r)
 	if err := r.Validate(); err != nil {
 		return err
 	}
@@ -437,7 +497,8 @@ func (s *Store) DeleteUserLimits(username string) error {
 	return nil
 }
 
-// MigrateDefaultKeys appends newly added config keys to an existing default.conf without overwriting user edits.
+// MigrateDefaultKeys appends newly added config keys to an existing default.conf without overwriting user edits,
+// and migrates any legacy MYSQL_PENALTY_* values that exceed MYSQL_MAX_* ceilings (N3).
 func (s *Store) MigrateDefaultKeys() error {
 	path := s.DefaultConfPath()
 	existingKV, err := ParseKeyValueFile(path)
@@ -448,8 +509,14 @@ func (s *Store) MigrateDefaultKeys() error {
 		return err
 	}
 
-	def := DefaultLimits()
-	canonicalLines := strings.Split(FormatLimits(def), "\n")
+	merged := ApplyKV(DefaultLimits(), existingKV)
+	clamped, clampNotes := merged.ClampPenaltyUpperBounds()
+
+	seedTemplate := DefaultLimits()
+	seedTemplate.MySQLPenaltyConn = clamped.MySQLPenaltyConn
+	seedTemplate.MySQLPenaltyTimeSec = clamped.MySQLPenaltyTimeSec
+
+	canonicalLines := strings.Split(FormatLimits(seedTemplate), "\n")
 	var missing []string
 	for _, line := range canonicalLines {
 		trimmed := strings.TrimSpace(line)
@@ -465,7 +532,7 @@ func (s *Store) MigrateDefaultKeys() error {
 			missing = append(missing, trimmed)
 		}
 	}
-	if len(missing) == 0 {
+	if len(missing) == 0 && len(clampNotes) == 0 {
 		return nil
 	}
 
@@ -473,7 +540,26 @@ func (s *Store) MigrateDefaultKeys() error {
 	if err != nil {
 		return err
 	}
-	content := strings.TrimRight(string(raw), "\n") + "\n\n# Migrated keys\n" + strings.Join(missing, "\n") + "\n"
+	text := string(raw)
+	if len(clampNotes) > 0 {
+		s.logClampOnce("default.conf", clampNotes)
+		lines := strings.Split(text, "\n")
+		for i, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "MYSQL_PENALTY_CONN=") {
+				lines[i] = fmt.Sprintf("MYSQL_PENALTY_CONN=%d", clamped.MySQLPenaltyConn)
+			} else if strings.HasPrefix(trimmed, "MYSQL_PENALTY_TIME_SEC=") {
+				lines[i] = fmt.Sprintf("MYSQL_PENALTY_TIME_SEC=%d", clamped.MySQLPenaltyTimeSec)
+			}
+		}
+		text = strings.Join(lines, "\n")
+	}
+
+	content := strings.TrimRight(text, "\n")
+	if len(missing) > 0 {
+		content += "\n\n# Migrated keys\n" + strings.Join(missing, "\n")
+	}
+	content += "\n"
 	return atomicWriteFile(path, []byte(content), 0o640)
 }
 

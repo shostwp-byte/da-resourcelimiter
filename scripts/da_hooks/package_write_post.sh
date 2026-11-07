@@ -11,5 +11,5 @@ if [[ -z "$TARGET_PKG" || ! -x "$DAEMON_BIN" ]]; then
     exit 0
 fi
 
-timeout 20s "$DAEMON_BIN" apply-package "$TARGET_PKG" >/dev/null 2>&1 || true
+timeout 25s "$DAEMON_BIN" apply-package "$TARGET_PKG" >/dev/null 2>&1 || true
 exit 0

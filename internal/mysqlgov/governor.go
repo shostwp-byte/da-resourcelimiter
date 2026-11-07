@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -19,11 +20,15 @@ import (
 	"github.com/shostwp-byte/da-resourcelimiter/internal/logger"
 )
 
-const DefaultPenaltyStatePath = "/var/lib/da-resourced/penalty_state.json"
+const (
+	DefaultPenaltyStatePath    = "/var/lib/da-resourced/penalty_state.json"
+	MaxAlterStatementsPerBatch = 200
+)
 
 var protectedMySQLAccounts = map[string]struct{}{
 	"root":             {},
 	"da_admin":         {},
+	"debian-sys-maint": {},
 	"mysql":            {},
 	"mariadb.sys":      {},
 	"mysql.sys":        {},
@@ -124,27 +129,22 @@ func (g *Governor) DetectCapabilities(ctx context.Context) error {
 }
 
 // GetLiveUsage returns the latest cached MariaDB usage & penalty status for a DirectAdmin user.
+// An entry remains reported as penalized until MariaDB normal limits have been successfully restored (N14).
 func (g *Governor) GetLiveUsage(username string) (LiveUserMySQLUsage, PenaltyEntry, bool) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	u := g.liveUsage[username]
 	p, penalized := g.penalties[username]
-	if penalized && g.NowFunc().Unix() >= p.ExpiresUnix {
-		penalized = false
-	}
 	return u, p, penalized
 }
 
-// ActivePenalties returns all currently active Penalty Box entries.
+// ActivePenalties returns all Penalty Box entries currently enforced in MariaDB (including entries pending restore retry).
 func (g *Governor) ActivePenalties() []PenaltyEntry {
-	now := g.NowFunc().Unix()
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	var out []PenaltyEntry
 	for _, p := range g.penalties {
-		if now < p.ExpiresUnix {
-			out = append(out, p)
-		}
+		out = append(out, p)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].Username < out[j].Username
@@ -190,14 +190,14 @@ func (g *Governor) ApplyUserAccountLimits(ctx context.Context, daUsername string
 }
 
 // ApplyBatchUserLimits synchronizes MariaDB Tier-2 limits for all supplied DirectAdmin accounts
-// in a single SELECT + single batched ALTER USER execution instead of 2*N mysql invocations (R4).
+// in a single SELECT + chunked ALTER USER executions (<= 200 statements/chunk) instead of 2*N mysql invocations (R4, N4, N5).
 func (g *Governor) ApplyBatchUserLimits(ctx context.Context, limitsByUser map[string]config.ResourceLimits) error {
 	if len(limitsByUser) == 0 || g.Registry == nil {
 		return nil
 	}
 
 	rows, err := g.Runner.QueryTSV(ctx,
-		"SELECT User, Host FROM mysql.user WHERE User NOT IN ('root', 'da_admin', 'mysql', 'mariadb.sys', 'mysql.sys', 'mysql.session', 'mysql.infoschema', 'PUBLIC');",
+		"SELECT User, Host FROM mysql.user WHERE User NOT IN ('root', 'da_admin', 'debian-sys-maint', 'mysql', 'mariadb.sys', 'mysql.sys', 'mysql.session', 'mysql.infoschema', 'PUBLIC');",
 	)
 	if err != nil {
 		return err
@@ -206,8 +206,7 @@ func (g *Governor) ApplyBatchUserLimits(ctx context.Context, limitsByUser map[st
 		return nil
 	}
 
-	var batch strings.Builder
-	count := 0
+	var statements []string
 	for _, line := range rows {
 		parts := strings.Split(line, "\t")
 		if len(parts) < 2 {
@@ -227,17 +226,12 @@ func (g *Governor) ApplyBatchUserLimits(ctx context.Context, limitsByUser map[st
 			continue
 		}
 		maxConn, maxTime := g.effectiveMySQLCaps(acct.Username, limits)
-		fmt.Fprintf(&batch,
-			"ALTER USER '%s'@'%s' WITH MAX_USER_CONNECTIONS %d MAX_STATEMENT_TIME %d;\n",
+		statements = append(statements, fmt.Sprintf(
+			"ALTER USER '%s'@'%s' WITH MAX_USER_CONNECTIONS %d MAX_STATEMENT_TIME %d;",
 			escapeSQLString(u), escapeSQLString(h), maxConn, maxTime,
-		)
-		count++
+		))
 	}
-	if count == 0 {
-		return nil
-	}
-	batch.WriteString("FLUSH USER_RESOURCES;\n")
-	return g.Runner.ExecBatch(ctx, batch.String())
+	return g.execChunkedAlterStatements(ctx, statements)
 }
 
 // RemoveUserAccountLimits resets MariaDB per-user limits back to unlimited (0) when a user is disabled or uninstalled.
@@ -323,8 +317,7 @@ func (g *Governor) execAlterForUserHostRows(ctx context.Context, rows []string, 
 		return nil
 	}
 
-	var batch strings.Builder
-	count := 0
+	var statements []string
 	for _, line := range rows {
 		parts := strings.Split(line, "\t")
 		if len(parts) < 2 {
@@ -335,45 +328,104 @@ func (g *Governor) execAlterForUserHostRows(ctx context.Context, rows []string, 
 		if u == "" || h == "" || isProtectedDBUser(u) {
 			continue
 		}
-		fmt.Fprintf(&batch,
-			"ALTER USER '%s'@'%s' WITH MAX_USER_CONNECTIONS %d MAX_STATEMENT_TIME %d;\n",
+		statements = append(statements, fmt.Sprintf(
+			"ALTER USER '%s'@'%s' WITH MAX_USER_CONNECTIONS %d MAX_STATEMENT_TIME %d;",
 			escapeSQLString(u), escapeSQLString(h), maxConn, maxTime,
-		)
-		count++
+		))
 	}
-	if count == 0 {
-		return nil
-	}
-	batch.WriteString("FLUSH USER_RESOURCES;\n")
-	return g.Runner.ExecBatch(ctx, batch.String())
+	return g.execChunkedAlterStatements(ctx, statements)
 }
 
-// UnblockUser immediately removes a user from the Penalty Box and restores their configured DB limits.
+func (g *Governor) execChunkedAlterStatements(ctx context.Context, statements []string) error {
+	if len(statements) == 0 {
+		return nil
+	}
+	chunkSize := MaxAlterStatementsPerBatch
+	if chunkSize <= 0 {
+		chunkSize = 200
+	}
+
+	var errs []string
+	for start := 0; start < len(statements); start += chunkSize {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		end := start + chunkSize
+		if end > len(statements) {
+			end = len(statements)
+		}
+		var batch strings.Builder
+		for _, stmt := range statements[start:end] {
+			batch.WriteString(stmt)
+			batch.WriteByte('\n')
+		}
+		batch.WriteString("FLUSH USER_RESOURCES;\n")
+		if err := g.Runner.ExecBatch(ctx, batch.String()); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+func (g *Governor) restoreAccountBaseLimits(ctx context.Context, acct dausers.Account) error {
+	if isProtectedDBUser(acct.Username) {
+		return nil
+	}
+	limits, err := g.ResolveLimits(acct)
+	if err != nil {
+		return err
+	}
+	maxConn, maxTime := 0, 0
+	if limits.Enabled {
+		maxConn = limits.MySQLMaxConnections
+		maxTime = limits.MySQLMaxStatementTime
+		if maxConn < 1 {
+			maxConn = 1
+		}
+		if maxTime < 1 {
+			maxTime = 1
+		}
+	}
+	return g.alterAllDBUsersForSystemUser(ctx, acct.Username, maxConn, maxTime)
+}
+
+// UnblockUser restores configured DB limits FIRST and only removes the user from the Penalty Box
+// after MariaDB accepts the restored limits, preventing stranded penalties on DB timeout (N14).
 func (g *Governor) UnblockUser(ctx context.Context, daUsername string) error {
 	if err := config.ValidateIdentifier(daUsername); err != nil {
 		return err
 	}
 
-	g.mu.Lock()
+	g.mu.RLock()
 	_, existed := g.penalties[daUsername]
-	delete(g.penalties, daUsername)
-	delete(g.violationTimestamps, daUsername)
-	_ = g.savePenaltyStateLocked()
-	g.mu.Unlock()
+	g.mu.RUnlock()
 
 	acct, ok := g.Registry.LookupByName(daUsername)
 	if !ok {
 		if !existed {
 			return fmt.Errorf("user %q not found", daUsername)
 		}
+		g.mu.Lock()
+		delete(g.penalties, daUsername)
+		delete(g.violationTimestamps, daUsername)
+		_ = g.savePenaltyStateLocked()
+		g.mu.Unlock()
 		return nil
 	}
 
-	limits, err := g.ResolveLimits(acct)
-	if err != nil {
+	if err := g.restoreAccountBaseLimits(ctx, acct); err != nil {
 		return err
 	}
-	return g.ApplyUserAccountLimits(ctx, daUsername, limits)
+
+	g.mu.Lock()
+	delete(g.penalties, daUsername)
+	delete(g.violationTimestamps, daUsername)
+	_ = g.savePenaltyStateLocked()
+	g.mu.Unlock()
+	return nil
 }
 
 // PollOnce executes one cycle of the Tier-3 MariaDB Watchdog.
@@ -390,12 +442,12 @@ func (g *Governor) PollOnce(ctx context.Context) (killedCount int, err error) {
 		selectSQL = "SELECT ID, USER, COMMAND, CAST(IFNULL(TIME_MS, TIME * 1000) AS SIGNED), IFNULL(MEMORY_USED, 0), " +
 			"REPLACE(REPLACE(LEFT(IFNULL(INFO, ''), 512), '\\n', ' '), '\\t', ' ') " +
 			"FROM information_schema.PROCESSLIST " +
-			"WHERE USER NOT IN ('root', 'da_admin', 'system user', 'event_scheduler', 'mariadb.sys');"
+			"WHERE USER NOT IN ('root', 'da_admin', 'debian-sys-maint', 'system user', 'event_scheduler', 'mariadb.sys');"
 	} else {
 		selectSQL = "SELECT ID, USER, COMMAND, CAST(TIME * 1000 AS SIGNED), 0, " +
 			"REPLACE(REPLACE(LEFT(IFNULL(INFO, ''), 512), '\\n', ' '), '\\t', ' ') " +
 			"FROM information_schema.PROCESSLIST " +
-			"WHERE USER NOT IN ('root', 'da_admin', 'system user', 'event_scheduler', 'mariadb.sys');"
+			"WHERE USER NOT IN ('root', 'da_admin', 'debian-sys-maint', 'system user', 'event_scheduler', 'mariadb.sys');"
 	}
 
 	lines, err := g.Runner.QueryTSV(ctx, selectSQL)
@@ -596,9 +648,15 @@ func (g *Governor) recordViolationAndMaybePenalize(ctx context.Context, now time
 	if penConn < 1 {
 		penConn = 1
 	}
+	if limits.MySQLMaxConnections >= 1 && penConn > limits.MySQLMaxConnections {
+		penConn = limits.MySQLMaxConnections
+	}
 	penTime := limits.MySQLPenaltyTimeSec
 	if penTime < 1 {
 		penTime = 1
+	}
+	if limits.MySQLMaxStatementTime >= 1 && penTime > limits.MySQLMaxStatementTime {
+		penTime = limits.MySQLMaxStatementTime
 	}
 
 	nowUnix := now.Unix()
@@ -650,33 +708,60 @@ func (g *Governor) recordViolationAndMaybePenalize(ctx context.Context, now time
 	}
 }
 
+// expirePenalties restores normal MariaDB limits FIRST and only deletes expired penalty entries
+// from memory and penalty_state.json once restoration succeeds (or the DA user was deleted),
+// ensuring transient MariaDB timeouts are automatically retried on subsequent polls (N3, N14).
 func (g *Governor) expirePenalties(ctx context.Context, now time.Time) {
 	nowUnix := now.Unix()
 	var expiredUsers []string
 
-	g.mu.Lock()
+	g.mu.RLock()
 	for uname, p := range g.penalties {
 		if nowUnix >= p.ExpiresUnix {
 			expiredUsers = append(expiredUsers, uname)
-			delete(g.penalties, uname)
 		}
 	}
-	if len(expiredUsers) > 0 {
-		_ = g.savePenaltyStateLocked()
-	}
-	g.mu.Unlock()
+	g.mu.RUnlock()
 
+	if len(expiredUsers) == 0 {
+		return
+	}
+
+	var clearedUsers []string
 	for _, uname := range expiredUsers {
 		acct, ok := g.Registry.LookupByName(uname)
 		if !ok {
+			if g.Registry != nil && g.Registry.CanPruneOrphanUID(0) {
+				// Registry has completed at least one valid reload and user is absent
+				clearedUsers = append(clearedUsers, uname)
+			} else if g.Registry != nil && g.Registry.Count() > 0 {
+				clearedUsers = append(clearedUsers, uname)
+			}
 			continue
 		}
-		limits, err := g.ResolveLimits(acct)
-		if err != nil {
+		if err := g.restoreAccountBaseLimits(ctx, acct); err != nil {
+			log.Printf("warning: failed to restore MariaDB limits after penalty expiry for %s (will retry): %v", uname, err)
 			continue
 		}
-		_ = g.ApplyUserAccountLimits(ctx, uname, limits)
+		clearedUsers = append(clearedUsers, uname)
 	}
+
+	if len(clearedUsers) == 0 {
+		return
+	}
+
+	g.mu.Lock()
+	changed := false
+	for _, uname := range clearedUsers {
+		if cur, ok := g.penalties[uname]; ok && nowUnix >= cur.ExpiresUnix {
+			delete(g.penalties, uname)
+			changed = true
+		}
+	}
+	if changed {
+		_ = g.savePenaltyStateLocked()
+	}
+	g.mu.Unlock()
 }
 
 func (g *Governor) loadPenaltyState() error {
@@ -769,6 +854,11 @@ func parseProcessRow(line string) (processRow, bool) {
 	}, true
 }
 
+// isActiveQueryCommand intentionally counts only SQL text execution ("Query") and prepared
+// statement execution ("Execute") toward active-query concurrency and per-user query RAM limits.
+// Idle connections ("Sleep") and non-SQL protocol commands ("Connect", "Init DB", "Prepare",
+// "Quit", "Binlog Dump") are still counted in TotalConnections (capped by MAX_USER_CONNECTIONS),
+// avoiding false-positive query kills on pooled idle connections (N20b).
 func isActiveQueryCommand(cmd string) bool {
 	switch cmd {
 	case "Query", "Execute":

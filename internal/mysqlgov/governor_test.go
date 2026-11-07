@@ -2,6 +2,7 @@ package mysqlgov
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,6 +20,7 @@ type mockSQLRunner struct {
 	mysqlUsers  []string
 	executedSQL []string
 	queryCalls  int
+	failExecErr error
 }
 
 func (m *mockSQLRunner) QueryTSV(_ context.Context, sql string) ([]string, error) {
@@ -27,12 +29,44 @@ func (m *mockSQLRunner) QueryTSV(_ context.Context, sql string) ([]string, error
 		return m.processRows, nil
 	}
 	if strings.Contains(sql, "FROM mysql.user") {
-		return m.mysqlUsers, nil
+		return filterMockMySQLUsers(m.mysqlUsers, sql), nil
 	}
 	return nil, nil
 }
 
+// filterMockMySQLUsers emulates MariaDB WHERE User = / LIKE / NOT IN clauses so unit tests catch cross-tenant bugs (N20e).
+func filterMockMySQLUsers(rows []string, sql string) []string {
+	var exactUser, prefix string
+	if idx := strings.Index(sql, "WHERE (User = '"); idx >= 0 {
+		rest := sql[idx+len("WHERE (User = '"):]
+		if end := strings.IndexByte(rest, '\''); end >= 0 {
+			exactUser = rest[:end]
+			prefix = exactUser + "_"
+		}
+	}
+
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		parts := strings.SplitN(r, "\t", 2)
+		if len(parts) < 2 {
+			continue
+		}
+		u := parts[0]
+		if isProtectedDBUser(u) && strings.Contains(sql, "NOT IN") {
+			continue
+		}
+		if exactUser != "" && u != exactUser && !strings.HasPrefix(u, prefix) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
 func (m *mockSQLRunner) ExecBatch(_ context.Context, sql string) error {
+	if m.failExecErr != nil {
+		return m.failExecErr
+	}
 	m.executedSQL = append(m.executedSQL, sql)
 	return nil
 }
@@ -169,5 +203,92 @@ func TestMySQLOptionEscapingAndIdempotentWrite(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `password="p\\ass\"word"`) {
 		t.Fatalf("expected escaped backslash and quote in mysql-client.cnf (R8), got:\n%s", string(raw))
+	}
+}
+
+func TestBatchStderrClassificationChunkingProtectedDebianAndPenaltyRetry(t *testing.T) {
+	// 1. N4: classifyMySQLBatchStderr ignores benign race ERROR 1094 (Unknown thread id) while catching real SQL errors
+	if nonBenign, onlyBenign := classifyMySQLBatchStderr("ERROR 1094 (HY000) at line 1: Unknown thread id: 902\n"); len(nonBenign) != 0 || !onlyBenign {
+		t.Fatalf("expected benign ERROR 1094 to be ignored (N4), got nonBenign=%v onlyBenign=%v", nonBenign, onlyBenign)
+	}
+	if nonBenign, onlyBenign := classifyMySQLBatchStderr("ERROR 1396 (HY000) at line 2: Operation ALTER USER failed for 'gone'@'localhost'\n"); len(nonBenign) == 0 || onlyBenign {
+		t.Fatalf("expected ERROR 1396 to be surfaced as a batch failure (N4), got nonBenign=%v onlyBenign=%v", nonBenign, onlyBenign)
+	}
+
+	// 2. N20a: debian-sys-maint is strictly protected alongside root, mysql, and da_admin
+	if !isProtectedDBUser("debian-sys-maint") || !isProtectedDBUser("da_admin") {
+		t.Fatal("expected debian-sys-maint and da_admin to be protected MySQL accounts (N20a)")
+	}
+
+	// 3. N5: >200 ALTER USER statements are split into chunks of MaxAlterStatementsPerBatch (200)
+	tmp := t.TempDir()
+	passwdFile := filepath.Join(tmp, "passwd")
+	daDir := filepath.Join(tmp, "users")
+	_ = os.WriteFile(passwdFile, []byte("bigacct:x:1010:1010::/home/bigacct:/bin/bash\n"), 0o644)
+	_ = os.MkdirAll(filepath.Join(daDir, "bigacct"), 0o755)
+	_ = os.WriteFile(filepath.Join(daDir, "bigacct", "user.conf"), []byte("usertype=user\npackage=vip\n"), 0o600)
+
+	reg := dausers.NewRegistry(daDir, passwdFile)
+	_ = reg.Reload()
+
+	var manyUsers []string
+	manyUsers = append(manyUsers, "debian-sys-maint\tlocalhost")
+	for i := 0; i < 450; i++ {
+		manyUsers = append(manyUsers, fmt.Sprintf("bigacct_db%d\tlocalhost", i))
+	}
+
+	runner := &mockSQLRunner{mysqlUsers: manyUsers}
+	lim := config.DefaultLimits()
+	lim.MySQLPenaltyEnabled = true
+	lim.MySQLPenaltyThreshold = 1
+	lim.MySQLPenaltyDurationSec = 60
+
+	now := time.Unix(1700005000, 0)
+	gov := NewGovernor(runner, reg, func(_ dausers.Account) (config.ResourceLimits, error) {
+		return lim, nil
+	}, nil, filepath.Join(tmp, "penalties.json"))
+	gov.NowFunc = func() time.Time { return now }
+
+	if err := gov.ApplyBatchUserLimits(context.Background(), map[string]config.ResourceLimits{"bigacct": lim}); err != nil {
+		t.Fatalf("ApplyBatchUserLimits 450 DB users: %v", err)
+	}
+	if len(runner.executedSQL) != 3 {
+		t.Fatalf("expected 450 ALTER USER statements to be chunked into 3 batches (200+200+50) (N5), got %d", len(runner.executedSQL))
+	}
+
+	// 4. N14: Penalty expiry & UnblockUser MUST retain penalty state if MariaDB ExecBatch fails, and clear ONLY after restore succeeds!
+	mb := uint64(1024 * 1024)
+	runner.processRows = []string{fmt.Sprintf("777\tbigacct_db0\tQuery\t1000\t%d\tSELECT 1", 400*mb)}
+	if _, err := gov.PollOnce(context.Background()); err != nil {
+		t.Fatalf("PollOnce trigger penalty: %v", err)
+	}
+	if _, _, penalized := gov.GetLiveUsage("bigacct"); !penalized {
+		t.Fatal("expected bigacct to enter Penalty Box")
+	}
+
+	// Advance past expiry while MariaDB fails to execute ALTER USER
+	runner.processRows = nil
+	runner.failExecErr = errors.New("mariadb connection refused")
+	now = now.Add(120 * time.Second)
+
+	if err := gov.UnblockUser(context.Background(), "bigacct"); err == nil {
+		t.Fatal("expected UnblockUser to return error when MariaDB restore fails (N14)")
+	}
+	if _, _, stillPenalized := gov.GetLiveUsage("bigacct"); !stillPenalized {
+		t.Fatal("expected penalty to remain active when UnblockUser restore failed (N14)")
+	}
+
+	_, _ = gov.PollOnce(context.Background())
+	if _, _, stillPenalized := gov.GetLiveUsage("bigacct"); !stillPenalized {
+		t.Fatal("expected expirePenalties to retain penalty for retry when MariaDB restore failed (N14)")
+	}
+
+	// Restore MariaDB connectivity -> next PollOnce restores normal limits and clears penalty!
+	runner.failExecErr = nil
+	if _, err := gov.PollOnce(context.Background()); err != nil {
+		t.Fatalf("PollOnce retry restore: %v", err)
+	}
+	if _, _, stillPenalized := gov.GetLiveUsage("bigacct"); stillPenalized {
+		t.Fatal("expected penalty to lift once MariaDB restore succeeded (N14)")
 	}
 }

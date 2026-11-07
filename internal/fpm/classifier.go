@@ -5,16 +5,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/shostwp-byte/da-resourcelimiter/internal/cgroup"
 	"github.com/shostwp-byte/da-resourcelimiter/internal/config"
 	"github.com/shostwp-byte/da-resourcelimiter/internal/dausers"
 )
+
+const DefaultLockDir = "/run/da-resourced/locks"
 
 // UIDFunc extracts the real owner UID of a /proc/<pid> directory (overridable in unit tests).
 type UIDFunc func(procPIDPath string) (uint32, error)
@@ -38,6 +43,7 @@ type Classifier struct {
 
 	mu           sync.Mutex
 	classifiedOK map[string]classifiedPID // pid -> (uid, startTime) cache guarded by mu
+	lastErrLogAt time.Time
 }
 
 var userConfSyncMu sync.Mutex
@@ -53,6 +59,17 @@ func NewClassifier(procRoot string, reg *dausers.Registry, cgMgr *cgroup.Manager
 		ReadUID:      statUID,
 		IsEnabled:    isEnabled,
 		classifiedOK: make(map[string]classifiedPID, 256),
+	}
+}
+
+func (c *Classifier) logCgroupErrorLocked(msg string, err error) {
+	if err == nil || errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
+		return
+	}
+	now := time.Now()
+	if now.Sub(c.lastErrLogAt) >= 60*time.Second {
+		c.lastErrLogAt = now
+		log.Printf("warning: %s: %v", msg, err)
 	}
 }
 
@@ -81,11 +98,13 @@ func (c *Classifier) ScanOnce(ctx context.Context, filterUID uint32) (int, error
 		alivePIDs[pid] = struct{}{}
 
 		procPath := filepath.Join(c.ProcRoot, pid)
-		curStart := readProcStartTime(procPath)
+		curStart := ""
 
-		// Fast skip only if this exact (PID, startTime) instance was already verified inside da-php.scope
-		if cached, ok := c.classifiedOK[pid]; ok && cached.startTime == curStart {
-			if filterUID == 0 || cached.uid == filterUID {
+		// Fast skip only if this exact (PID, startTime) instance was already verified inside da-php.scope.
+		// Non-cached PIDs check comm FIRST before reading /proc/<pid>/stat to save /proc I/O (N17).
+		if cached, ok := c.classifiedOK[pid]; ok {
+			curStart = readProcStartTime(procPath)
+			if cached.startTime == curStart && (filterUID == 0 || cached.uid == filterUID) {
 				continue
 			}
 		}
@@ -97,6 +116,9 @@ func (c *Classifier) ScanOnce(ctx context.Context, filterUID uint32) (int, error
 		comm := strings.TrimSpace(string(commRaw))
 		if !isPHPWorkerComm(comm) {
 			continue
+		}
+		if curStart == "" {
+			curStart = readProcStartTime(procPath)
 		}
 
 		uid, err := c.ReadUID(procPath)
@@ -133,6 +155,7 @@ func (c *Classifier) ScanOnce(ctx context.Context, filterUID uint32) (int, error
 		}
 
 		if err := c.CgroupMgr.EnsureSliceAndPHPScope(ctx, uid); err != nil {
+			c.logCgroupErrorLocked(fmt.Sprintf("ensure da-php.scope for uid %d", uid), err)
 			continue
 		}
 
@@ -150,6 +173,7 @@ func (c *Classifier) ScanOnce(ctx context.Context, filterUID uint32) (int, error
 
 		procsFile := filepath.Join(c.CgroupMgr.PHPScopeDir(uid), "cgroup.procs")
 		if err := writePIDToCgroupProcs(procsFile, pid); err != nil {
+			c.logCgroupErrorLocked(fmt.Sprintf("write pid %s to %s", pid, procsFile), err)
 			continue
 		}
 
@@ -243,10 +267,12 @@ func SyncDAUserPHPConf(daUsersDir, username string, limits config.ResourceLimits
 		return nil
 	}
 
-	unlock, lockErr := acquireFileLock(filepath.Join(userDir, ".user.conf.da-limiter.lock"))
+	unlock, lockErr := acquireFileLock(resolveUserConfLockPath(username))
 	if lockErr == nil && unlock != nil {
 		defer unlock()
 	}
+	// Clean up legacy v1.0.4.1 lockfile inside DirectAdmin user directory if present (N20c)
+	_ = os.Remove(filepath.Join(userDir, ".user.conf.da-limiter.lock"))
 
 	rawBytes, err := os.ReadFile(userConf)
 	if err != nil {
@@ -277,6 +303,7 @@ func SyncDAUserPHPConf(daUsersDir, username string, limits config.ResourceLimits
 
 	var keptLines []string
 	scanner := bufio.NewScanner(strings.NewReader(string(rawBytes)))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
 		trimmed := strings.TrimSpace(line)
@@ -372,4 +399,19 @@ func lookupAccountUIDGID(passwdPath, username string) (int, int) {
 		}
 	}
 	return -1, -1
+}
+
+// resolveUserConfLockPath places advisory lock files under /run/da-resourced/locks (0700)
+// instead of leaving dotfiles inside /usr/local/directadmin/data/users/<user> (N20c).
+func resolveUserConfLockPath(username string) string {
+	lockDir := strings.TrimSpace(os.Getenv("DA_LIMITER_LOCK_DIR"))
+	if lockDir == "" {
+		lockDir = DefaultLockDir
+	}
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
+		fallback := filepath.Join(os.TempDir(), fmt.Sprintf("da-resourced-locks-%d", os.Geteuid()))
+		_ = os.MkdirAll(fallback, 0o700)
+		lockDir = fallback
+	}
+	return filepath.Join(lockDir, username+".user.conf.lock")
 }

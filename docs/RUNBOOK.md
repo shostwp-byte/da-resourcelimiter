@@ -1,6 +1,6 @@
 # SỔ TAY VẬN HÀNH & TRIỂN KHAI PRODUCTION (`RUNBOOK.md`)
 
-**Dự án:** `DA-ResourceLimiter` (`v1.0.4.1`)  
+**Dự án:** `DA-ResourceLimiter` (`v1.0.4.2`)  
 **Repository:** https://github.com/shostwp-byte/da-resourcelimiter  
 
 ---
@@ -26,16 +26,18 @@
 
 ## 2. CÀI ĐẶT XÁC THỰC THEO TAG TRÊN MÁY CHỦ MỚI
 
-### Trường hợp A: Repository ở chế độ Public (Ghim Tag + Kiểm tra SHA-256)
+### Trường hợp A: Repository ở chế độ Public (Ghim Tag + Kiểm tra Ed25519 & SHA-256)
 Chạy lệnh sau dưới quyền `root`:
 ```bash
-VER="v1.0.4.1"
+VER="v1.0.4.2"
 ARCH="$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
 TMP_DIR="$(mktemp -d /tmp/da-limiter.XXXXXX)" && chmod 0700 "$TMP_DIR"
 curl -fsSL "https://github.com/shostwp-byte/da-resourcelimiter/releases/download/${VER}/checksums.txt" -o "${TMP_DIR}/checksums.txt"
+curl -fsSL "https://github.com/shostwp-byte/da-resourcelimiter/releases/download/${VER}/checksums.txt.sig" -o "${TMP_DIR}/checksums.txt.sig"
 curl -fsSL "https://github.com/shostwp-byte/da-resourcelimiter/releases/download/${VER}/da-resource-limiter-linux-${ARCH}.tar.gz" -o "${TMP_DIR}/da-resource-limiter-linux-${ARCH}.tar.gz"
 (cd "$TMP_DIR" && grep " da-resource-limiter-linux-${ARCH}\.tar\.gz$" checksums.txt | sha256sum -c -)
 tar -xzf "${TMP_DIR}/da-resource-limiter-linux-${ARCH}.tar.gz" -C "$TMP_DIR"
+"${TMP_DIR}/da-resource-limiter/bin/da-resourced" verify "${TMP_DIR}/checksums.txt" "${TMP_DIR}/checksums.txt.sig"
 "${TMP_DIR}/da-resource-limiter/scripts/install.sh"
 rm -rf "$TMP_DIR"
 ```
@@ -44,10 +46,10 @@ rm -rf "$TMP_DIR"
 1. Trên GitHub, vào **Settings → Developer settings → Personal access tokens → Fine-grained tokens**.
 2. Chọn Repository access: **Only select repositories** → `shostwp-byte/da-resourcelimiter`.
 3. Mục **Repository permissions** → cấp duy nhất quyền **Contents: Read-only**.
-4. Truyền header xác thực qua `stdin` (`curl -K -`) để **không bao giờ lộ Token** trong `ps aux` hay `/proc/<pid>/cmdline`:
+4. Truyền header xác thực qua `stdin` (`curl -K -`) để **không bao giờ lộ Token** trong `ps aux` hay `/proc/<pid>/cmdline` (script `install.sh` sẽ tự xác thực chữ ký **Ed25519** bằng OpenSSL/libsodium trước khi giải nén):
    ```bash
    export GITHUB_TOKEN="github_pat_XXXXXXXXXXXXXXXXXXXX"
-   export TARGET_VERSION="v1.0.4.1"
+   export TARGET_VERSION="v1.0.4.2"
    TMP_INST="$(mktemp /tmp/da-install.XXXXXX.sh)" && chmod 0700 "$TMP_INST"
    printf 'header = "Authorization: Bearer %s"\n' "$GITHUB_TOKEN" | \
      curl -fsSL -K - "https://raw.githubusercontent.com/shostwp-byte/da-resourcelimiter/${TARGET_VERSION}/scripts/install.sh" -o "$TMP_INST"
@@ -82,16 +84,16 @@ Từ phiên bản `v1.0.4.1`, daemon nhúng sẵn khoá công khai Ed25519 trong
    ```
    Workflow `.github/workflows/release.yml` sẽ tự động kiểm tra commit thuộc nhánh `main`, chạy `gofmt`, `staticcheck`, `go test -race`, `shellcheck`, biên dịch đa kiến trúc, ký số `checksums.txt.sig` bằng Ed25519 và xuất bản Release.
 
-### 3.2. Cập nhật trên máy chủ DirectAdmin
-Để ngăn chặn leo thang đặc quyền từ các tài khoản quản trị phụ trong `admin.list`, các hành động cập nhật/khôi phục hệ thống và đổi cấu hình Updater chỉ cho phép thực thi bởi `root` hoặc `diradmin`:
+### 3.2. Cập nhật trên máy chủ DirectAdmin (Khoá cứng cho `root` CLI)
+Do DirectAdmin thực thi các endpoint CGI quản trị dưới quyền hệ thống chung `diradmin` bất kể tài khoản quản trị chính hay phụ đăng nhập, mọi thao tác thay đổi cấu hình Updater, kích hoạt tự cập nhật và khôi phục bản sao lưu được khoá cứng chỉ cho phép tiến trình `root` (`UID 0` qua SSH CLI). Nếu doanh nghiệp vận hành mirror/fork nội bộ có ký số cùng khoá, cần khai báo tường minh `ALLOW_CUSTOM_REPO=yes` trong `/etc/da-resourced/updater.conf` (`0600 root:root`):
 ```bash
-# Kiểm tra bản mới:
+# Kiểm tra bản mới (cũng có thể kiểm tra trực tiếp trên Tab 5 Web UI):
 da-resourced check-update
 
 # Cập nhật hoặc thay đổi GitHub Token an toàn qua stdin:
 printf '%s' 'github_pat_XXXX' | da-resourced config-updater --token-stdin --channel stable
 
-# Tải về, xác thực chữ ký Ed25519 + SHA-256, tạo Snapshot và cập nhật nguyên tử:
+# Tải về, xác thực chữ ký Ed25519 + SHA-256 + manifest.json, tạo Snapshot và cập nhật nguyên tử:
 da-resourced update
 
 # Hoặc khôi phục bản sao lưu gần nhất bất cứ lúc nào:

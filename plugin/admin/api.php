@@ -196,6 +196,49 @@ function normalize_host_header(string $hostHeader): array
     return array_values(array_unique($candidates));
 }
 
+function load_configured_allowed_hosts(): array
+{
+    $rawList = [];
+    $envHosts = getenv('DA_LIMITER_ALLOWED_HOSTS');
+    if (is_string($envHosts) && trim($envHosts) !== '') {
+        foreach (explode(',', $envHosts) as $item) {
+            if (trim($item) !== '') {
+                $rawList[] = trim($item);
+            }
+        }
+    }
+
+    $webConf = '/etc/da-resourced/web.conf';
+    if (@is_readable($webConf)) {
+        $lines = @file($webConf, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        if (is_array($lines)) {
+            foreach ($lines as $line) {
+                $trimmed = trim((string) $line);
+                if ($trimmed === '' || $trimmed[0] === '#') {
+                    continue;
+                }
+                if (stripos($trimmed, 'ALLOWED_HOSTS=') === 0) {
+                    $val = trim(substr($trimmed, strlen('ALLOWED_HOSTS=')));
+                    $val = trim($val, "\"'");
+                    foreach (explode(',', $val) as $item) {
+                        if (trim($item) !== '') {
+                            $rawList[] = trim($item);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    $normalized = [];
+    foreach ($rawList as $h) {
+        foreach (normalize_host_header($h) as $cand) {
+            $normalized[] = $cand;
+        }
+    }
+    return array_values(array_unique($normalized));
+}
+
 function verify_same_origin_post(): ?string
 {
     $secFetch = strtolower(trim((string) (getenv('HTTP_SEC_FETCH_SITE') ?: '')));
@@ -211,12 +254,23 @@ function verify_same_origin_post(): ?string
             $rawHost = $srvPort !== '' ? ($srvName . ':' . $srvPort) : $srvName;
         }
     }
-    $allowedHosts = normalize_host_header($rawHost);
+
+    $allowedHosts = array_values(array_unique(array_merge(
+        normalize_host_header($rawHost),
+        load_configured_allowed_hosts()
+    )));
+
+    $origin = trim((string) (getenv('HTTP_ORIGIN') ?: ''));
+    $referer = trim((string) (getenv('HTTP_REFERER') ?: ''));
+
+    // Fail closed if browser sent Origin/Referer while DirectAdmin CGI omitted host authority (N12).
     if (empty($allowedHosts)) {
+        if ($origin !== '' || $referer !== '') {
+            return 'Forbidden: cannot verify Origin/Referer because HTTP_HOST and DA_LIMITER_ALLOWED_HOSTS are missing';
+        }
         return null;
     }
 
-    $origin = trim((string) (getenv('HTTP_ORIGIN') ?: ''));
     if ($origin !== '') {
         if (strtolower($origin) === 'null') {
             return 'Forbidden: null Origin header rejected';
@@ -228,7 +282,6 @@ function verify_same_origin_post(): ?string
         return null;
     }
 
-    $referer = trim((string) (getenv('HTTP_REFERER') ?: ''));
     if ($referer !== '') {
         $refAuth = normalize_url_authority($referer);
         if ($refAuth === '' || !in_array($refAuth, $allowedHosts, true)) {
@@ -239,13 +292,70 @@ function verify_same_origin_post(): ?string
     return null;
 }
 
+/**
+ * Resolves the process effective UID safely even when `php -n` (api.raw) omits dynamic ext-posix.
+ * Never falls back to getmyuid(), which returns the script file's inode owner instead of euid (N10).
+ */
 function current_effective_uid(): int
 {
-    if (function_exists('posix_geteuid')) {
-        return (int) posix_geteuid();
+    static $cachedUid = null;
+    if ($cachedUid !== null) {
+        return $cachedUid;
     }
-    $myUid = getmyuid();
-    return $myUid !== false ? (int) $myUid : 0;
+
+    if (function_exists('posix_geteuid')) {
+        $cachedUid = (int) posix_geteuid();
+        return $cachedUid;
+    }
+
+    if (@is_readable('/proc/self/status')) {
+        $status = @file_get_contents('/proc/self/status');
+        if (is_string($status) && preg_match('/^Uid:\s+\d+\s+(\d+)/m', $status, $m) === 1) {
+            $cachedUid = (int) $m[1];
+            return $cachedUid;
+        }
+    }
+
+    if (DIRECTORY_SEPARATOR === '/') {
+        $probeDir = is_dir('/dev/shm') && is_writable('/dev/shm') ? '/dev/shm' : sys_get_temp_dir();
+        $oldMask = umask(0077);
+        $probeFile = @tempnam($probeDir, '.darl_uid_');
+        umask($oldMask);
+        if (is_string($probeFile) && $probeFile !== '') {
+            $st = @lstat($probeFile);
+            @unlink($probeFile);
+            if (is_array($st) && isset($st['uid'])) {
+                $cachedUid = (int) $st['uid'];
+                return $cachedUid;
+            }
+        }
+        $cachedUid = -1;
+        return $cachedUid;
+    }
+
+    $cachedUid = 0;
+    return $cachedUid;
+}
+
+function lookup_passwd_homedir(int $uid): string
+{
+    if ($uid < 0 || !@is_readable('/etc/passwd')) {
+        return '';
+    }
+    $fh = @fopen('/etc/passwd', 'rb');
+    if ($fh === false) {
+        return '';
+    }
+    $foundDir = '';
+    while (($line = fgets($fh)) !== false) {
+        $parts = explode(':', rtrim($line, "\r\n"));
+        if (count($parts) >= 6 && (int) $parts[2] === $uid && ctype_digit($parts[2])) {
+            $foundDir = trim($parts[5]);
+            break;
+        }
+    }
+    fclose($fh);
+    return $foundDir;
 }
 
 function resolve_csrf_key_candidates(int $uid): array
@@ -255,22 +365,39 @@ function resolve_csrf_key_candidates(int $uid): array
     if (is_string($override) && trim($override) !== '') {
         $paths[] = trim($override);
     }
-    if (function_exists('posix_getpwuid')) {
+    if ($uid < 0 && empty($paths)) {
+        return [];
+    }
+    if (function_exists('posix_getpwuid') && $uid >= 0) {
         $pw = @posix_getpwuid($uid);
         if (is_array($pw) && !empty($pw['dir']) && is_dir($pw['dir'])) {
             $paths[] = rtrim((string) $pw['dir'], '/') . '/.da_limiter_csrf.key';
         }
     }
+    $pwHome = lookup_passwd_homedir($uid);
+    if ($pwHome !== '' && is_dir($pwHome)) {
+        $paths[] = rtrim($pwHome, '/') . '/.da_limiter_csrf.key';
+    }
     $home = trim((string) (getenv('HOME') ?: ''));
     if ($home !== '' && is_dir($home)) {
         $paths[] = rtrim($home, '/') . '/.da_limiter_csrf.key';
     }
-    $paths[] = rtrim(sys_get_temp_dir(), '/\\') . DIRECTORY_SEPARATOR . '.da_limiter_csrf_' . $uid . '.key';
+    $pluginDataDir = dirname(__DIR__) . DIRECTORY_SEPARATOR . 'data';
+    if (is_dir($pluginDataDir)) {
+        $paths[] = $pluginDataDir . DIRECTORY_SEPARATOR . '.csrf_uid_' . $uid . '.key';
+    }
+    // Never fall back to world-writable /tmp on POSIX hosts (N12); allow temp dir only on Windows test runner.
+    if (DIRECTORY_SEPARATOR === '\\') {
+        $paths[] = rtrim(sys_get_temp_dir(), '/\\') . DIRECTORY_SEPARATOR . '.da_limiter_csrf_' . $uid . '.key';
+    }
     return array_values(array_unique($paths));
 }
 
 function read_or_init_secret_file(string $path, int $uid): ?string
 {
+    if ($uid < 0 && DIRECTORY_SEPARATOR === '/') {
+        return null;
+    }
     clearstatcache(true, $path);
     if (file_exists($path) || is_link($path)) {
         if (is_link($path)) {
@@ -293,7 +420,9 @@ function read_or_init_secret_file(string $path, int $uid): ?string
         return null;
     }
 
+    $oldUmask = umask(0077);
     $fp = @fopen($path, 'xb');
+    umask($oldUmask);
     if ($fp === false) {
         return null;
     }
@@ -456,6 +585,12 @@ if (isset($mutatingActions[$action])) {
     $originErr = verify_same_origin_post();
     if ($originErr !== null) {
         emit_json(['ok' => false, 'error' => $originErr], 403);
+    }
+    if ($csrfSecret === '') {
+        emit_json([
+            'ok' => false,
+            'error' => 'Forbidden: unable to initialize per-UID CSRF key file (verify ownership/0600 permissions of HOME or plugin/data directory)',
+        ], 403);
     }
     if (!verify_csrf_token($csrfSecret, $providedCsrfToken)) {
         emit_json(['ok' => false, 'error' => 'Forbidden: invalid or missing CSRF token (reload the page and try again)'], 403);

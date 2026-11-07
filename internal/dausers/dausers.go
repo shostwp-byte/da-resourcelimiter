@@ -38,9 +38,12 @@ type Registry struct {
 	MinUID     uint32
 	MaxUID     uint32
 
+	reloadMu         sync.Mutex
 	mu               sync.RWMutex
 	byName           map[string]Account
 	byUID            map[uint32]Account
+	passwdUIDs       map[uint32]struct{}
+	missingStreaks   map[uint32]int
 	sortedNamesDesc  []string
 	lastSkipLogState string
 }
@@ -65,12 +68,13 @@ func NewRegistry(daUsersDir, passwdPath string) *Registry {
 		}
 	}
 	return &Registry{
-		daUsersDir: daUsersDir,
-		passwdPath: passwdPath,
-		MinUID:     minUID,
-		MaxUID:     maxUID,
-		byName:     make(map[string]Account),
-		byUID:      make(map[uint32]Account),
+		daUsersDir:     daUsersDir,
+		passwdPath:     passwdPath,
+		MinUID:         minUID,
+		MaxUID:         maxUID,
+		byName:         make(map[string]Account),
+		byUID:          make(map[uint32]Account),
+		missingStreaks: make(map[uint32]int),
 	}
 }
 
@@ -98,7 +102,12 @@ type passwdEntry struct {
 }
 
 // Reload scans /etc/passwd and /usr/local/directadmin/data/users to rebuild the in-memory lookup tables.
+// Serialized via r.reloadMu so concurrent periodic and hook-triggered reloads never overwrite newer state (N15).
+// Treats missing daUsersDir as an error and retains prior active accounts if a user.conf fails to parse (N2).
 func (r *Registry) Reload() error {
+	r.reloadMu.Lock()
+	defer r.reloadMu.Unlock()
+
 	pwMap, err := parsePasswd(r.passwdPath)
 	if err != nil {
 		return fmt.Errorf("parse passwd %s: %w", r.passwdPath, err)
@@ -106,16 +115,20 @@ func (r *Registry) Reload() error {
 
 	entries, err := os.ReadDir(r.daUsersDir)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			r.mu.Lock()
-			r.byName = make(map[string]Account)
-			r.byUID = make(map[uint32]Account)
-			r.sortedNamesDesc = nil
-			r.mu.Unlock()
-			return nil
-		}
 		return fmt.Errorf("read DirectAdmin users dir %s: %w", r.daUsersDir, err)
 	}
+
+	nextPasswdUIDs := make(map[uint32]struct{}, len(pwMap))
+	for _, pe := range pwMap {
+		nextPasswdUIDs[pe.uid] = struct{}{}
+	}
+
+	r.mu.RLock()
+	prevByName := make(map[string]Account, len(r.byName))
+	for k, v := range r.byName {
+		prevByName[k] = v
+	}
+	r.mu.RUnlock()
 
 	minU, maxU := r.effectiveBounds()
 	nextByName := make(map[string]Account, len(entries))
@@ -145,6 +158,24 @@ func (r *Registry) Reload() error {
 		userConfPath := filepath.Join(r.daUsersDir, username, "user.conf")
 		kv, err := config.ParseKeyValueFile(userConfPath)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Printf("warning: read %s failed (%v); retaining user %q in registry", userConfPath, err, username)
+			if prev, hadPrev := prevByName[username]; hadPrev {
+				prev.UID = pw.uid
+				prev.GID = pw.gid
+				nextByName[username] = prev
+				nextByUID[pw.uid] = prev
+				names = append(names, username)
+			} else if username != "admin" {
+				acct := Account{
+					Username: username,
+					UID:      pw.uid,
+					GID:      pw.gid,
+					UserType: "user",
+				}
+				nextByName[username] = acct
+				nextByUID[pw.uid] = acct
+				names = append(names, username)
+			}
 			continue
 		}
 
@@ -181,6 +212,19 @@ func (r *Registry) Reload() error {
 	skipSummary := fmt.Sprintf("admin=%d,uid_range=%d(%d..%d)", skippedAdmin, skippedUIDRange, minU, maxU)
 
 	r.mu.Lock()
+	nextStreaks := make(map[uint32]int)
+	for uid := range r.byUID {
+		if _, stillPresent := nextByUID[uid]; !stillPresent {
+			nextStreaks[uid] = 1
+		}
+	}
+	for uid, prevCount := range r.missingStreaks {
+		if _, stillPresent := nextByUID[uid]; !stillPresent {
+			nextStreaks[uid] = prevCount + 1
+		}
+	}
+	r.missingStreaks = nextStreaks
+	r.passwdUIDs = nextPasswdUIDs
 	r.byName = nextByName
 	r.byUID = nextByUID
 	r.sortedNamesDesc = names
@@ -193,6 +237,25 @@ func (r *Registry) Reload() error {
 			len(nextByName), skippedAdmin, skippedUIDRange, minU, maxU)
 	}
 	return nil
+}
+
+// CanPruneOrphanUID reports whether a slice UID absent from ActiveUIDSet is safe to delete during
+// untargeted periodic pruning: only after at least one successful Reload() AND either the UID is gone
+// from /etc/passwd or has been absent across >= 2 consecutive successful Reload() cycles (N2).
+func (r *Registry) CanPruneOrphanUID(uid uint32) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if r.passwdUIDs == nil {
+		return false
+	}
+	if _, active := r.byUID[uid]; active {
+		return false
+	}
+	if _, inPasswd := r.passwdUIDs[uid]; !inPasswd {
+		return true
+	}
+	return r.missingStreaks[uid] >= 2
 }
 
 func (r *Registry) LookupByName(username string) (Account, bool) {
@@ -274,6 +337,7 @@ func parsePasswd(path string) (map[string]passwdEntry, error) {
 
 	res := make(map[string]passwdEntry)
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {

@@ -23,22 +23,29 @@ jobs:
           go-version: 'stable'
           cache: false
 
-      - name: Check LF line endings on scripts and configs
+      - name: Check LF line endings on scripts, configs, and workflows
         run: |
-          if grep -rnU $'\r' scripts/ plugin/ systemd/ Makefile 2>/dev/null; then
-            echo "Error: CRLF line endings detected in Linux scripts/configs!"
+          if grep -rnU $'\r' scripts/ plugin/ systemd/ Makefile .github/workflows/ 2>/dev/null; then
+            echo "Error: CRLF line endings detected in Linux scripts/configs/workflows!"
             exit 1
           fi
 
-      - name: Verify single-source version consistency (plugin.conf == version.go)
+      - name: Verify single-source version & Ed25519 public key consistency
         run: |
+          set -euo pipefail
           PLUGIN_VER="v$(awk -F= '/^version=/{print $2}' plugin/plugin.conf | tr -d '[:space:]')"
           GO_VER="$(sed -n 's/.*Version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' internal/version/version.go | head -n 1)"
           if [[ -z "$PLUGIN_VER" || "$PLUGIN_VER" != "$GO_VER" ]]; then
             echo "Error: version mismatch between plugin/plugin.conf ($PLUGIN_VER) and internal/version/version.go ($GO_VER)"
             exit 1
           fi
-          echo "Verified version sync: $GO_VER"
+          INSTALL_PUB="$(sed -n 's/^PINNED_ED25519_PUBKEY_HEX="\([^"]*\)".*/\1/p' scripts/install.sh | head -n 1)"
+          GO_PUB="$(sed -n 's/.*DefaultReleasePublicKeyHex[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' internal/version/version.go | head -n 1)"
+          if [[ -z "$INSTALL_PUB" || "$INSTALL_PUB" != "$GO_PUB" ]]; then
+            echo "Error: Ed25519 public key mismatch between scripts/install.sh ($INSTALL_PUB) and internal/version/version.go ($GO_PUB)"
+            exit 1
+          fi
+          echo "Verified version sync ($GO_VER) & Ed25519 pubkey sync ($GO_PUB)"
 
       - name: Verify gofmt formatting
         run: |

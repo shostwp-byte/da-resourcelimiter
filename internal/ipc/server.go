@@ -18,8 +18,11 @@ const (
 	maxRequestBytes           = 64 * 1024
 	DefaultMaxAdminConns      = 32
 	DefaultMaxUserConns       = 64
+	DefaultMaxPerUIDUserConns = 4
 	DefaultUserRateLimitBurst = 20
 	DefaultUserRateWindow     = 5 * time.Second
+	DefaultReadTimeout        = 2 * time.Second
+	DefaultRequestTimeout     = 12 * time.Second
 )
 
 // RequestHandler processes decoded IPC requests for Admin and User sockets.
@@ -43,7 +46,7 @@ type uidRateWindow struct {
 
 // Server listens on the Admin Unix Socket and the read-only Customer Unix Socket,
 // authenticating every caller via Linux Kernel SO_PEERCRED UID verification before JSON decoding,
-// enforcing bounded concurrency semaphores and per-UID rate limits (S5).
+// enforcing bounded concurrency semaphores, per-UID active connection caps, and rate limits (S5, N8, N9).
 type Server struct {
 	AdminSocketPath    string
 	UserSocketPath     string
@@ -52,12 +55,16 @@ type Server struct {
 	GetPeerUID         PeerUIDFunc
 	MaxAdminConns      int
 	MaxUserConns       int
+	MaxPerUIDUserConns int
 	UserRateLimitBurst int
 	UserRateWindow     time.Duration
+	ReadTimeout        time.Duration
+	RequestTimeout     time.Duration
 	NowFunc            func() time.Time
 
 	rateMu      sync.Mutex
 	userRates   map[uint32]uidRateWindow
+	activeByUID map[uint32]int
 	lastCleanup time.Time
 
 	wg sync.WaitGroup
@@ -78,10 +85,14 @@ func NewServer(adminSock, userSock string, handler RequestHandler) *Server {
 		GetPeerUID:         readPeerUID,
 		MaxAdminConns:      DefaultMaxAdminConns,
 		MaxUserConns:       DefaultMaxUserConns,
+		MaxPerUIDUserConns: DefaultMaxPerUIDUserConns,
 		UserRateLimitBurst: DefaultUserRateLimitBurst,
 		UserRateWindow:     DefaultUserRateWindow,
+		ReadTimeout:        DefaultReadTimeout,
+		RequestTimeout:     DefaultRequestTimeout,
 		NowFunc:            time.Now,
 		userRates:          make(map[uint32]uidRateWindow),
+		activeByUID:        make(map[uint32]int),
 	}
 }
 
@@ -167,11 +178,21 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, isAdminSocket 
 	}
 }
 
-// ServeConn verifies kernel SO_PEERCRED UID and per-UID rate limits BEFORE decoding JSON,
-// then dispatches a single request-response exchange (S5).
+// ServeConn verifies kernel SO_PEERCRED UID, per-UID active connection caps, and rate limits BEFORE decoding JSON,
+// enforces a tight 2s read deadline against idle connections (N8), and bounds handler execution with a per-request timeout (N9).
 func (s *Server) ServeConn(ctx context.Context, conn net.Conn, isAdminSocket bool) {
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+
+	readTimeout := s.ReadTimeout
+	if readTimeout <= 0 {
+		readTimeout = DefaultReadTimeout
+	}
+	reqTimeout := s.RequestTimeout
+	if reqTimeout <= 0 {
+		reqTimeout = DefaultRequestTimeout
+	}
+
+	_ = conn.SetDeadline(time.Now().Add(readTimeout))
 
 	peerUID, err := s.GetPeerUID(conn)
 	if err != nil {
@@ -186,9 +207,17 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, isAdminSocket boo
 		}
 	}
 
-	if !isAdminSocket && peerUID != 0 && !s.allowUserRequest(peerUID) {
-		writeResponse(conn, Response{OK: false, Error: "rate limit exceeded: please wait a few seconds before retrying"})
-		return
+	if !isAdminSocket && peerUID != 0 {
+		if !s.acquireUserUIDSlot(peerUID) {
+			writeResponse(conn, Response{OK: false, Error: "too many concurrent connections for this account"})
+			return
+		}
+		defer s.releaseUserUIDSlot(peerUID)
+
+		if !s.allowUserRequest(peerUID) {
+			writeResponse(conn, Response{OK: false, Error: "rate limit exceeded: please wait a few seconds before retrying"})
+			return
+		}
 	}
 
 	var req Request
@@ -198,14 +227,48 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn, isAdminSocket boo
 		return
 	}
 
+	reqCtx, cancel := context.WithTimeout(ctx, reqTimeout)
+	defer cancel()
+	_ = conn.SetWriteDeadline(time.Now().Add(reqTimeout + 2*time.Second))
+
 	var resp Response
 	if isAdminSocket {
-		resp = s.Handler.HandleAdminRequest(ctx, peerUID, req)
+		resp = s.Handler.HandleAdminRequest(reqCtx, peerUID, req)
 	} else {
-		resp = s.Handler.HandleUserRequest(ctx, peerUID, req)
+		resp = s.Handler.HandleUserRequest(reqCtx, peerUID, req)
 	}
 
 	writeResponse(conn, resp)
+}
+
+func (s *Server) acquireUserUIDSlot(uid uint32) bool {
+	maxPerUID := s.MaxPerUIDUserConns
+	if maxPerUID <= 0 {
+		return true
+	}
+	s.rateMu.Lock()
+	defer s.rateMu.Unlock()
+	if s.activeByUID == nil {
+		s.activeByUID = make(map[uint32]int)
+	}
+	if s.activeByUID[uid] >= maxPerUID {
+		return false
+	}
+	s.activeByUID[uid]++
+	return true
+}
+
+func (s *Server) releaseUserUIDSlot(uid uint32) {
+	s.rateMu.Lock()
+	defer s.rateMu.Unlock()
+	if s.activeByUID == nil {
+		return
+	}
+	if cur := s.activeByUID[uid]; cur <= 1 {
+		delete(s.activeByUID, uid)
+	} else {
+		s.activeByUID[uid] = cur - 1
+	}
 }
 
 func (s *Server) allowUserRequest(uid uint32) bool {

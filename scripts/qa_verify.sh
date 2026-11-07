@@ -28,6 +28,24 @@ run_preflight() {
 
     if systemctl is-active --quiet da-resourced; then
         pass "systemd unit da-resourced.service is active"
+        local main_pid
+        main_pid=$(systemctl show -p MainPID --value da-resourced 2>/dev/null || echo "0")
+        if [[ "$EUID" -eq 0 && -n "$main_pid" && "$main_pid" != "0" && -d "/proc/${main_pid}/root/sys/fs/cgroup" ]]; then
+            if [[ -w "/proc/${main_pid}/root/sys/fs/cgroup" ]]; then
+                pass "Daemon mount namespace has write access to /sys/fs/cgroup (N7)"
+            else
+                fail "Daemon mount namespace has read-only /sys/fs/cgroup (check systemd unit)"
+            fi
+            for sock_candidate in /tmp/mysql.sock /var/lib/mysql/mysql.sock /run/mysqld/mysqld.sock /home/mysql/mysql.sock; do
+                if [[ -S "$sock_candidate" ]]; then
+                    if [[ -S "/proc/${main_pid}/root${sock_candidate}" ]]; then
+                        pass "Daemon mount namespace sees MySQL socket ${sock_candidate} (N7)"
+                    else
+                        fail "Daemon mount namespace CANNOT see host MySQL socket ${sock_candidate} (PrivateTmp conflict)"
+                    fi
+                fi
+            done
+        fi
     else
         fail "systemd unit da-resourced.service is NOT running"
     fi
@@ -143,6 +161,11 @@ run_verify_user() {
 
     if [[ -d "${slice_dir}/da-php.scope" ]]; then
         pass "PHP worker sub-cgroup active: ${slice_dir}/da-php.scope"
+        if [[ -f "${slice_dir}/da-php.scope/cgroup.procs" ]]; then
+            local scope_pids
+            scope_pids=$(wc -l < "${slice_dir}/da-php.scope/cgroup.procs" | tr -d '[:space:]')
+            info "Active PHP worker PIDs inside da-php.scope: ${scope_pids}"
+        fi
     else
         fail "PHP worker sub-cgroup missing: ${slice_dir}/da-php.scope"
     fi

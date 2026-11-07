@@ -129,3 +129,59 @@ func TestApplyUserSliceStatsAndOrphanPrune(t *testing.T) {
 		t.Fatalf("expected positive CPUPercent delta, got %f", secondStats.CPUPercent)
 	}
 }
+
+func TestPruneOrphanSlicesCircuitBreakerAndConfirmationPolicy(t *testing.T) {
+	tmp := t.TempDir()
+	systemdDir := filepath.Join(tmp, "systemd")
+	cgRoot := filepath.Join(tmp, "cgroup")
+	mgr := NewManager(systemdDir, cgRoot, &fakeRunner{})
+
+	lim := config.DefaultLimits()
+	for idx, uid := range []uint32{1001, 1002, 1003, 1004, 1005, 1006} {
+		user := "user" + string(rune('a'+idx))
+		if _, err := mgr.StageUserSliceForAccount(user, uid, lim); err != nil {
+			t.Fatalf("StageUserSliceForAccount %d: %v", uid, err)
+		}
+	}
+
+	// 1. N2: Empty validUIDs map when managed drop-ins exist MUST abort with error without deleting anything!
+	prunedEmpty, err := mgr.PruneOrphanSlicesWithPolicy(context.Background(), map[uint32]struct{}{}, "", nil)
+	if err == nil || prunedEmpty != 0 {
+		t.Fatalf("expected empty validUIDs guard to abort with pruned=0, got pruned=%d err=%v", prunedEmpty, err)
+	}
+	if _, err := os.Stat(mgr.SliceDropInPath(1001)); err != nil {
+		t.Fatal("slice 1001 must remain untouched when validUIDs is empty")
+	}
+
+	// 2. N2: Mass-deletion circuit breaker (>20% missing: 2 out of 6 = 33% > 20%) MUST abort untargeted sweep!
+	partialValid := map[uint32]struct{}{1001: {}, 1002: {}, 1003: {}, 1004: {}}
+	prunedMass, err := mgr.PruneOrphanSlicesWithPolicy(context.Background(), partialValid, "", nil)
+	if err == nil || prunedMass != 0 {
+		t.Fatalf("expected >20%% circuit breaker to abort mass deletion, got pruned=%d err=%v", prunedMass, err)
+	}
+	if _, err := os.Stat(mgr.SliceDropInPath(1005)); err != nil {
+		t.Fatal("slice 1005 must survive mass-deletion circuit breaker")
+	}
+
+	// 3. N2: Single missing UID (1 out of 6 = 16.6% <= 20%) respects confirmOrphan callback!
+	fiveValid := map[uint32]struct{}{1001: {}, 1002: {}, 1003: {}, 1004: {}, 1005: {}}
+	prunedUnconfirmed, err := mgr.PruneOrphanSlicesWithPolicy(context.Background(), fiveValid, "", func(_ uint32) bool {
+		return false
+	})
+	if err != nil || prunedUnconfirmed != 0 {
+		t.Fatalf("expected unconfirmed orphan to be retained, got pruned=%d err=%v", prunedUnconfirmed, err)
+	}
+	if _, err := os.Stat(mgr.SliceDropInPath(1006)); err != nil {
+		t.Fatal("unconfirmed orphan 1006 must remain on disk")
+	}
+
+	prunedConfirmed, err := mgr.PruneOrphanSlicesWithPolicy(context.Background(), fiveValid, "", func(uid uint32) bool {
+		return uid == 1006
+	})
+	if err != nil || prunedConfirmed != 1 {
+		t.Fatalf("expected confirmed orphan 1006 to be pruned, got pruned=%d err=%v", prunedConfirmed, err)
+	}
+	if _, err := os.Stat(mgr.SliceDropInPath(1006)); !os.IsNotExist(err) {
+		t.Fatalf("expected confirmed orphan 1006 to be removed, err=%v", err)
+	}
+}

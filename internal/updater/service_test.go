@@ -20,7 +20,7 @@ import (
 	"github.com/shostwp-byte/da-resourcelimiter/internal/config"
 )
 
-func buildMockReleaseTarGz(t *testing.T) ([]byte, string) {
+func buildMockReleaseTarGzWithVersion(t *testing.T, verTag string) ([]byte, string) {
 	t.Helper()
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
@@ -40,15 +40,21 @@ func buildMockReleaseTarGz(t *testing.T) ([]byte, string) {
 		}
 	}
 
-	addFile("da-resource-limiter/bin/da-resourced", 0o755, "#!/bin/sh\necho v1.2.0\n")
+	bare := strings.TrimPrefix(verTag, "v")
+	addFile("da-resource-limiter/bin/da-resourced", 0o755, "#!/bin/sh\necho "+verTag+"\n")
 	addFile("da-resource-limiter/scripts/update.sh", 0o755, "#!/bin/sh\nexit 0\n")
-	addFile("da-resource-limiter/plugin/plugin.conf", 0o644, "version=1.2.0\n")
+	addFile("da-resource-limiter/plugin/plugin.conf", 0o644, "version="+bare+"\n")
+	addFile("da-resource-limiter/manifest.json", 0o644, fmt.Sprintf("{\n  \"version\": %q,\n  \"arch\": \"amd64\"\n}\n", verTag))
 
 	_ = tw.Close()
 	_ = gz.Close()
 
 	sum := sha256.Sum256(buf.Bytes())
 	return buf.Bytes(), hex.EncodeToString(sum[:])
+}
+
+func buildMockReleaseTarGz(t *testing.T) ([]byte, string) {
+	return buildMockReleaseTarGzWithVersion(t, "v1.2.0")
 }
 
 func TestSemVerComparisonIncludingFourPartTags(t *testing.T) {
@@ -289,5 +295,68 @@ func TestPrivateRepoEd25519SignatureSHA256AndConcurrencyGuard(t *testing.T) {
 	}
 	if len(launchedArgs) != 0 {
 		t.Fatalf("update.sh must NEVER be launched when SHA-256 check fails, got %v", launchedArgs)
+	}
+
+	// 6. Anti-downgrade guard (N13): if running v1.5.0, staging v1.2.0 fails closed without --allow-downgrade
+	modeMu.Lock()
+	corruptChecksumMode = false
+	modeMu.Unlock()
+	svc.CurrentVersion = "v1.5.0"
+	svc.writeJobStatus("idle", "ready", "")
+	if _, err := svc.TriggerUpdate(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "refusing downgrade") {
+		t.Fatalf("expected downgrade from v1.5.0 to v1.2.0 to be rejected (N13), got err=%v", err)
+	}
+}
+
+func TestSignedOldArchiveTagReplayRejected(t *testing.T) {
+	// Build a genuinely signed v1.1.0 archive + checksums.txt + checksums.txt.sig,
+	// then serve it under GitHub Release tag "v1.2.0" to simulate a tag-replay attack (N13).
+	replayedArchive, replayedSHA := buildMockReleaseTarGzWithVersion(t, "v1.1.0")
+	pubHex, privHex, err := GenerateKeypairHex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	checksumsBody := fmt.Sprintf("%s  da-resource-limiter-linux-amd64.tar.gz\n", replayedSHA)
+	sigHex, err := SignDataHex(privHex, []byte(checksumsBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/shostwp-byte/da-resourcelimiter/releases/latest":
+			_ = json.NewEncoder(w).Encode(githubRelease{
+				TagName: "v1.2.0", // Attacker claims v1.2.0 while serving signed v1.1.0 assets!
+				Assets: []githubAsset{
+					{ID: 1, Name: "da-resource-limiter-linux-amd64.tar.gz", BrowserDownloadURL: srv.URL + "/dl/archive"},
+					{ID: 2, Name: "checksums.txt", BrowserDownloadURL: srv.URL + "/dl/checksums"},
+					{ID: 3, Name: "checksums.txt.sig", BrowserDownloadURL: srv.URL + "/dl/sig"},
+				},
+			})
+		case "/dl/archive":
+			_, _ = w.Write(replayedArchive)
+		case "/dl/checksums":
+			_, _ = w.Write([]byte(checksumsBody))
+		case "/dl/sig":
+			fmt.Fprintf(w, "%s  checksums.txt\n", sigHex)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	tmp := t.TempDir()
+	store := config.NewStore(filepath.Join(tmp, "data"), filepath.Join(tmp, "updater.conf"))
+	svc := NewService(store)
+	svc.APIBaseURL = srv.URL
+	svc.StagingRoot = filepath.Join(tmp, "staging")
+	svc.JobStatusPath = filepath.Join(tmp, "status.json")
+	svc.Arch = "amd64"
+	svc.CurrentVersion = "v1.0.4.2"
+	svc.ReleasePublicKeyHex = pubHex
+
+	if _, _, _, err := svc.StageRelease(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "release tag mismatch") {
+		t.Fatalf("expected signed-old-archive replay to fail closed with release tag mismatch (N13), got err=%v", err)
 	}
 }

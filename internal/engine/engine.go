@@ -34,6 +34,12 @@ type UpdaterProvider interface {
 	TriggerRollback(ctx context.Context) (string, error)
 }
 
+type adminAuthCacheEntry struct {
+	username  string
+	ok        bool
+	expiresAt time.Time
+}
+
 // Engine coordinates Cgroups v2, PHP-FPM classification, MariaDB Governor, Violation Logs, and IPC requests.
 type Engine struct {
 	StartedAt          time.Time
@@ -50,7 +56,20 @@ type Engine struct {
 	DiradminUID        uint32
 	AsyncSyncThreshold int
 
-	applyMu     sync.Mutex
+	applySemOnce sync.Once
+	applySem     chan struct{}
+
+	authCacheMu    sync.RWMutex
+	adminAuthCache map[uint32]adminAuthCacheEntry
+
+	bgMu          sync.Mutex
+	bgDirtyAll    bool
+	bgDirtyPkgs   map[string]struct{}
+	bgRunning     bool
+	bgActiveLabel string
+	bgWakeCh      chan struct{}
+	bgWorkerBound bool
+
 	oomMu       sync.Mutex
 	oomBaseline map[uint32]uint64
 }
@@ -71,7 +90,7 @@ func New(
 	if passwdPath == "" {
 		passwdPath = "/etc/passwd"
 	}
-	return &Engine{
+	e := &Engine{
 		StartedAt:          time.Now(),
 		Store:              store,
 		Registry:           reg,
@@ -84,7 +103,30 @@ func New(
 		PasswdPath:         passwdPath,
 		DiradminUID:        lookupUserUID(passwdPath, "diradmin"),
 		AsyncSyncThreshold: DefaultAsyncSyncThreshold,
+		adminAuthCache:     make(map[uint32]adminAuthCacheEntry),
+		bgDirtyPkgs:        make(map[string]struct{}),
+		bgWakeCh:           make(chan struct{}, 1),
 		oomBaseline:        make(map[uint32]uint64),
+	}
+	e.ensureApplySem()
+	return e
+}
+
+func (e *Engine) ensureApplySem() chan struct{} {
+	e.applySemOnce.Do(func() {
+		e.applySem = make(chan struct{}, 1)
+	})
+	return e.applySem
+}
+
+// acquireApplyLock acquires the single-slot apply semaphore while respecting ctx cancellation/deadlines (N9).
+func (e *Engine) acquireApplyLock(ctx context.Context) (func(), error) {
+	sem := e.ensureApplySem()
+	select {
+	case sem <- struct{}{}:
+		return func() { <-sem }, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("engine apply lock wait aborted: %w", ctx.Err())
 	}
 }
 
@@ -122,8 +164,11 @@ func (e *Engine) ApplyUser(ctx context.Context, username string) error {
 	if err := config.ValidateIdentifier(username); err != nil {
 		return err
 	}
-	e.applyMu.Lock()
-	defer e.applyMu.Unlock()
+	release, err := e.acquireApplyLock(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
 
 	return e.applyUserLocked(ctx, username, true)
 }
@@ -161,15 +206,25 @@ func (e *Engine) applyUserLocked(ctx context.Context, username string, reloadReg
 
 // ApplyAll batch-synchronizes Cgroups v2 slices, PHP tokens, and batched MariaDB limits for all DirectAdmin users.
 func (e *Engine) ApplyAll(ctx context.Context) error {
-	e.applyMu.Lock()
-	defer e.applyMu.Unlock()
+	release, err := e.acquireApplyLock(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
 
+	return e.applyAllLocked(ctx)
+}
+
+func (e *Engine) applyAllLocked(ctx context.Context) error {
 	accounts := e.Registry.All()
 	anySliceChanged := false
 	var enabledAccounts []dausers.Account
 	mysqlBatch := make(map[string]config.ResourceLimits, len(accounts))
 
 	for _, acct := range accounts {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		limits, err := e.Store.ResolveUserLimits(acct.Username, acct.Package)
 		if err != nil {
 			log.Printf("skip %s: resolve limits error: %v", acct.Username, err)
@@ -210,7 +265,7 @@ func (e *Engine) ApplyAll(ctx context.Context) error {
 		}
 	}
 
-	if pruned, err := e.CgroupMgr.PruneOrphanSlices(ctx, e.Registry.ActiveUIDSet(), ""); err != nil {
+	if pruned, err := e.CgroupMgr.PruneOrphanSlicesWithPolicy(ctx, e.Registry.ActiveUIDSet(), "", e.Registry.CanPruneOrphanUID); err != nil {
 		log.Printf("warning: prune orphan slices: %v", err)
 	} else if pruned > 0 {
 		log.Printf("pruned %d orphaned user-*.slice drop-in(s)", pruned)
@@ -224,9 +279,16 @@ func (e *Engine) ApplyPackage(ctx context.Context, packageName string) (int, err
 	if err := config.ValidateIdentifier(packageName); err != nil {
 		return 0, err
 	}
-	e.applyMu.Lock()
-	defer e.applyMu.Unlock()
+	release, err := e.acquireApplyLock(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
 
+	return e.applyPackageLocked(ctx, packageName)
+}
+
+func (e *Engine) applyPackageLocked(ctx context.Context, packageName string) (int, error) {
 	_ = e.Registry.Reload()
 
 	var targets []dausers.Account
@@ -250,6 +312,9 @@ func (e *Engine) ApplyPackage(ctx context.Context, packageName string) (int, err
 	synced := 0
 
 	for _, acct := range targets {
+		if err := ctx.Err(); err != nil {
+			return synced, err
+		}
 		limits, err := e.Store.ResolveUserLimits(acct.Username, acct.Package)
 		if err != nil {
 			log.Printf("apply package %s -> user %s resolve error: %v", packageName, acct.Username, err)
@@ -283,9 +348,10 @@ func (e *Engine) ApplyPackage(ctx context.Context, packageName string) (int, err
 	}
 	for _, acct := range enabledTargets {
 		_ = e.CgroupMgr.EnsureSliceAndPHPScope(ctx, acct.UID)
-		if e.Classifier != nil {
-			_, _ = e.Classifier.ScanOnce(ctx, acct.UID)
-		}
+	}
+	// Scan /proc once for all users in the package instead of N separate /proc walks (N17)
+	if len(enabledTargets) > 0 && e.Classifier != nil {
+		_, _ = e.Classifier.ScanOnce(ctx, 0)
 	}
 
 	return synced, nil
@@ -316,8 +382,11 @@ func (e *Engine) RemoveUser(ctx context.Context, username string) error {
 	if err := config.ValidateIdentifier(username); err != nil {
 		return err
 	}
-	e.applyMu.Lock()
-	defer e.applyMu.Unlock()
+	release, err := e.acquireApplyLock(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
 
 	if acct, ok := e.Registry.LookupByName(username); ok {
 		_ = e.CgroupMgr.RemoveUserSlice(ctx, acct.UID)
@@ -327,7 +396,7 @@ func (e *Engine) RemoveUser(ctx context.Context, username string) error {
 	}
 
 	_ = e.Registry.Reload()
-	if _, err := e.CgroupMgr.PruneOrphanSlices(ctx, e.Registry.ActiveUIDSet(), username); err != nil {
+	if _, err := e.CgroupMgr.PruneOrphanSlicesWithPolicy(ctx, e.Registry.ActiveUIDSet(), username, e.Registry.CanPruneOrphanUID); err != nil {
 		log.Printf("warning: prune orphan slice for removed user %s: %v", username, err)
 	}
 
@@ -344,8 +413,11 @@ func (e *Engine) RemoveUser(ctx context.Context, username string) error {
 // PruneOrphans scans /etc/systemd/system/user-*.slice.d/50-da-limits.conf and deletes drop-ins
 // whose UID is no longer an active DirectAdmin hosting account.
 func (e *Engine) PruneOrphans(ctx context.Context) {
-	e.applyMu.Lock()
-	defer e.applyMu.Unlock()
+	release, err := e.acquireApplyLock(ctx)
+	if err != nil {
+		return
+	}
+	defer release()
 
 	validUIDs := e.Registry.ActiveUIDSet()
 	e.oomMu.Lock()
@@ -356,21 +428,182 @@ func (e *Engine) PruneOrphans(ctx context.Context) {
 	}
 	e.oomMu.Unlock()
 
-	if pruned, err := e.CgroupMgr.PruneOrphanSlices(ctx, validUIDs, ""); err != nil {
+	if pruned, err := e.CgroupMgr.PruneOrphanSlicesWithPolicy(ctx, validUIDs, "", e.Registry.CanPruneOrphanUID); err != nil {
 		log.Printf("warning: periodic orphan slice prune failed: %v", err)
 	} else if pruned > 0 {
 		log.Printf("pruned %d orphaned user-*.slice drop-in(s)", pruned)
 	}
 }
 
-func (e *Engine) runBackgroundSync(label string, fn func(context.Context) error) {
+// StartBackgroundWorker launches a single WaitGroup-tracked background sync worker that coalesces
+// repeated default/package sync requests and starts its 5m execution timer AFTER acquiring applySem (N9).
+func (e *Engine) StartBackgroundWorker(ctx context.Context, wg *sync.WaitGroup) {
+	e.bgMu.Lock()
+	if e.bgWakeCh == nil {
+		e.bgWakeCh = make(chan struct{}, 1)
+	}
+	if e.bgDirtyPkgs == nil {
+		e.bgDirtyPkgs = make(map[string]struct{})
+	}
+	e.bgWorkerBound = true
+	wakeCh := e.bgWakeCh
+	e.bgMu.Unlock()
+
+	wg.Add(1)
 	go func() {
-		bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
-		if err := fn(bgCtx); err != nil {
-			log.Printf("background sync (%s) error: %v", label, err)
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-wakeCh:
+				e.drainBackgroundSyncQueue(ctx)
+			}
 		}
 	}()
+}
+
+// SyncStatus reports whether a coalesced background ApplyAll/ApplyPackage job is currently pending or running.
+func (e *Engine) SyncStatus() (inProgress bool, label string) {
+	e.bgMu.Lock()
+	defer e.bgMu.Unlock()
+	if e.bgRunning {
+		return true, e.bgActiveLabel
+	}
+	if e.bgDirtyAll {
+		return true, "queued:all"
+	}
+	if len(e.bgDirtyPkgs) > 0 {
+		return true, "queued:package"
+	}
+	return false, ""
+}
+
+func (e *Engine) enqueueBackgroundSyncAll() {
+	e.bgMu.Lock()
+	if e.bgWakeCh == nil {
+		e.bgWakeCh = make(chan struct{}, 1)
+	}
+	e.bgDirtyAll = true
+	// ApplyAll covers every package, so pending single-package syncs can be coalesced away.
+	for k := range e.bgDirtyPkgs {
+		delete(e.bgDirtyPkgs, k)
+	}
+	bound := e.bgWorkerBound
+	alreadyRunning := e.bgRunning
+	wakeCh := e.bgWakeCh
+	if !bound && !alreadyRunning {
+		e.bgRunning = true
+		e.bgActiveLabel = "default-limits"
+	}
+	e.bgMu.Unlock()
+
+	if bound {
+		select {
+		case wakeCh <- struct{}{}:
+		default:
+		}
+		return
+	}
+	if !alreadyRunning {
+		go e.drainBackgroundSyncQueue(context.Background())
+	}
+}
+
+func (e *Engine) enqueueBackgroundSyncPackage(pkg string) {
+	e.bgMu.Lock()
+	if e.bgWakeCh == nil {
+		e.bgWakeCh = make(chan struct{}, 1)
+	}
+	if e.bgDirtyPkgs == nil {
+		e.bgDirtyPkgs = make(map[string]struct{})
+	}
+	if !e.bgDirtyAll {
+		e.bgDirtyPkgs[pkg] = struct{}{}
+	}
+	bound := e.bgWorkerBound
+	alreadyRunning := e.bgRunning
+	wakeCh := e.bgWakeCh
+	if !bound && !alreadyRunning {
+		e.bgRunning = true
+		e.bgActiveLabel = "package:" + pkg
+	}
+	e.bgMu.Unlock()
+
+	if bound {
+		select {
+		case wakeCh <- struct{}{}:
+		default:
+		}
+		return
+	}
+	if !alreadyRunning {
+		go e.drainBackgroundSyncQueue(context.Background())
+	}
+}
+
+func (e *Engine) drainBackgroundSyncQueue(parentCtx context.Context) {
+	for {
+		if parentCtx.Err() != nil {
+			e.bgMu.Lock()
+			e.bgRunning = false
+			e.bgActiveLabel = ""
+			e.bgMu.Unlock()
+			return
+		}
+
+		e.bgMu.Lock()
+		doAll := e.bgDirtyAll
+		targetPkg := ""
+		if doAll {
+			e.bgDirtyAll = false
+			for k := range e.bgDirtyPkgs {
+				delete(e.bgDirtyPkgs, k)
+			}
+			e.bgRunning = true
+			e.bgActiveLabel = "default-limits"
+		} else {
+			for k := range e.bgDirtyPkgs {
+				targetPkg = k
+				delete(e.bgDirtyPkgs, k)
+				break
+			}
+			if targetPkg == "" {
+				e.bgRunning = false
+				e.bgActiveLabel = ""
+				e.bgMu.Unlock()
+				return
+			}
+			e.bgRunning = true
+			e.bgActiveLabel = "package:" + targetPkg
+		}
+		label := e.bgActiveLabel
+		e.bgMu.Unlock()
+
+		release, lockErr := e.acquireApplyLock(parentCtx)
+		if lockErr != nil {
+			e.bgMu.Lock()
+			e.bgRunning = false
+			e.bgActiveLabel = ""
+			e.bgMu.Unlock()
+			return
+		}
+
+		// Start the 5-minute budget ONLY AFTER acquiring applySem so queued jobs never starve on lock wait (N9c)
+		jobCtx, cancel := context.WithTimeout(parentCtx, 5*time.Minute)
+		var runErr error
+		if doAll {
+			runErr = e.applyAllLocked(jobCtx)
+		} else {
+			_, runErr = e.applyPackageLocked(jobCtx, targetPkg)
+		}
+		cancel()
+		release()
+
+		if runErr != nil && parentCtx.Err() == nil {
+			log.Printf("background sync (%s) error: %v", label, runErr)
+		}
+	}
 }
 
 func (e *Engine) countPackageUsers(packageName string) int {
@@ -457,6 +690,7 @@ func (e *Engine) BuildUserSnapshot(acct dausers.Account, include24hCounts bool) 
 
 // IsAuthorizedAdminUID verifies via Linux Kernel SO_PEERCRED UID whether the caller is root (0),
 // diradmin, or a DirectAdmin Administrator listed in admin.list / user.conf (usertype=admin).
+// Non-fast-path lookups are cached for 5s so unprivileged bursts cannot amplify disk I/O (N8).
 func (e *Engine) IsAuthorizedAdminUID(peerUID uint32) (string, bool) {
 	if peerUID == 0 {
 		return "root", true
@@ -465,6 +699,39 @@ func (e *Engine) IsAuthorizedAdminUID(peerUID uint32) (string, bool) {
 		return "diradmin", true
 	}
 
+	now := time.Now()
+	e.authCacheMu.RLock()
+	if e.adminAuthCache != nil {
+		if ent, exists := e.adminAuthCache[peerUID]; exists && now.Before(ent.expiresAt) {
+			e.authCacheMu.RUnlock()
+			return ent.username, ent.ok
+		}
+	}
+	e.authCacheMu.RUnlock()
+
+	username, ok := e.uncachedAuthorizedAdminUID(peerUID)
+
+	e.authCacheMu.Lock()
+	if e.adminAuthCache == nil {
+		e.adminAuthCache = make(map[uint32]adminAuthCacheEntry)
+	} else if len(e.adminAuthCache) > 256 {
+		for k, v := range e.adminAuthCache {
+			if !now.Before(v.expiresAt) {
+				delete(e.adminAuthCache, k)
+			}
+		}
+	}
+	e.adminAuthCache[peerUID] = adminAuthCacheEntry{
+		username:  username,
+		ok:        ok,
+		expiresAt: now.Add(5 * time.Second),
+	}
+	e.authCacheMu.Unlock()
+
+	return username, ok
+}
+
+func (e *Engine) uncachedAuthorizedAdminUID(peerUID uint32) (string, bool) {
 	username := lookupUsernameByUID(e.PasswdPath, peerUID)
 	if username == "" || config.ValidateIdentifier(username) != nil {
 		return "", false
@@ -540,8 +807,8 @@ func (e *Engine) HandleAdminRequest(ctx context.Context, peerUID uint32, req ipc
 		if req.SyncUsers {
 			total := e.Registry.Count()
 			if e.AsyncSyncThreshold > 0 && total > e.AsyncSyncThreshold {
-				e.runBackgroundSync("default-limits", e.ApplyAll)
-				return ipc.Response{OK: true, Message: fmt.Sprintf("saved default limits (background sync started for %d users)", total)}
+				e.enqueueBackgroundSyncAll()
+				return ipc.Response{OK: true, Message: fmt.Sprintf("saved default limits (background sync queued for %d users)", total)}
 			}
 			if err := e.ApplyAll(ctx); err != nil {
 				return ipc.Response{OK: false, Error: err.Error()}
@@ -559,12 +826,8 @@ func (e *Engine) HandleAdminRequest(ctx context.Context, peerUID uint32, req ipc
 		if req.SyncUsers {
 			pkgCount := e.countPackageUsers(req.Package)
 			if e.AsyncSyncThreshold > 0 && pkgCount > e.AsyncSyncThreshold {
-				pkg := req.Package
-				e.runBackgroundSync("package:"+pkg, func(bgCtx context.Context) error {
-					_, err := e.ApplyPackage(bgCtx, pkg)
-					return err
-				})
-				return ipc.Response{OK: true, Message: fmt.Sprintf("saved package %q (background sync started for %d users)", req.Package, pkgCount)}
+				e.enqueueBackgroundSyncPackage(req.Package)
+				return ipc.Response{OK: true, Message: fmt.Sprintf("saved package %q (background sync queued for %d users)", req.Package, pkgCount)}
 			}
 			synced, err := e.ApplyPackage(ctx, req.Package)
 			if err != nil {
@@ -606,12 +869,8 @@ func (e *Engine) HandleAdminRequest(ctx context.Context, peerUID uint32, req ipc
 	case ipc.ActionApplyPackageLimits:
 		pkgCount := e.countPackageUsers(req.Package)
 		if e.AsyncSyncThreshold > 0 && pkgCount > e.AsyncSyncThreshold {
-			pkg := req.Package
-			e.runBackgroundSync("package:"+pkg, func(bgCtx context.Context) error {
-				_, err := e.ApplyPackage(bgCtx, pkg)
-				return err
-			})
-			return ipc.Response{OK: true, Message: fmt.Sprintf("background sync started for %d users in package %q", pkgCount, req.Package)}
+			e.enqueueBackgroundSyncPackage(req.Package)
+			return ipc.Response{OK: true, Message: fmt.Sprintf("background sync queued for %d users in package %q", pkgCount, req.Package)}
 		}
 		synced, err := e.ApplyPackage(ctx, req.Package)
 		if err != nil {
@@ -651,7 +910,7 @@ func (e *Engine) HandleAdminRequest(ctx context.Context, peerUID uint32, req ipc
 		return ipc.Response{OK: true, Data: entries}
 
 	case ipc.ActionGetUpdaterStatus:
-		return e.handleGetUpdaterStatus(ctx)
+		return e.handleGetUpdaterStatus(ctx, peerUID)
 
 	case ipc.ActionCheckUpdate:
 		if e.Updater == nil {
@@ -661,22 +920,25 @@ func (e *Engine) HandleAdminRequest(ctx context.Context, peerUID uint32, req ipc
 		if err != nil {
 			return ipc.Response{OK: false, Error: err.Error()}
 		}
+		st.CanManageUpdater = (peerUID == 0)
 		return ipc.Response{OK: true, Data: st}
 
 	case ipc.ActionSaveUpdaterConfig:
-		if !e.IsRootOrDiradminUID(peerUID) {
+		// DirectAdmin executes admin/api.raw as UID diradmin regardless of which DA admin account is logged in,
+		// so root-equivalent updater mutations are strictly locked to UID 0 (root SSH CLI) (N11).
+		if peerUID != 0 {
 			return ipc.Response{
 				OK:    false,
-				Error: "permission denied: updater configuration is restricted to root/diradmin (use root CLI `da-resourced config-updater`)",
+				Error: "permission denied: updater configuration is restricted to root CLI (run `da-resourced config-updater` as root via SSH)",
 			}
 		}
 		return e.handleSaveUpdaterConfig(req)
 
 	case ipc.ActionTriggerUpdate:
-		if !e.IsRootOrDiradminUID(peerUID) {
+		if peerUID != 0 {
 			return ipc.Response{
 				OK:    false,
-				Error: "permission denied: self-update execution is restricted to root/diradmin (run `da-resourced update` as root via SSH)",
+				Error: "permission denied: self-update execution is restricted to root CLI (run `da-resourced update` as root via SSH)",
 			}
 		}
 		if e.Updater == nil {
@@ -689,10 +951,10 @@ func (e *Engine) HandleAdminRequest(ctx context.Context, peerUID uint32, req ipc
 		return ipc.Response{OK: true, Message: msg}
 
 	case ipc.ActionRollbackUpdate:
-		if !e.IsRootOrDiradminUID(peerUID) {
+		if peerUID != 0 {
 			return ipc.Response{
 				OK:    false,
-				Error: "permission denied: snapshot rollback is restricted to root/diradmin (run `da-resourced rollback` as root via SSH)",
+				Error: "permission denied: snapshot rollback is restricted to root CLI (run `da-resourced rollback` as root via SSH)",
 			}
 		}
 		if e.Updater == nil {
@@ -783,6 +1045,7 @@ func (e *Engine) buildPingData() ipc.PingData {
 	if e.MySQLGov != nil {
 		penalties = len(e.MySQLGov.ActivePenalties())
 	}
+	syncInProgress, syncLabel := e.SyncStatus()
 	return ipc.PingData{
 		Version:         version.Version,
 		Commit:          version.Commit,
@@ -790,6 +1053,8 @@ func (e *Engine) buildPingData() ipc.PingData {
 		UptimeSeconds:   int64(time.Since(e.StartedAt).Seconds()),
 		ManagedUsers:    e.Registry.Count(),
 		ActivePenalties: penalties,
+		SyncInProgress:  syncInProgress,
+		SyncLabel:       syncLabel,
 	}
 }
 
@@ -818,6 +1083,7 @@ func (e *Engine) listPackagesData() (ipc.PackagesData, error) {
 	if kv, err := config.ParseKeyValueFile(e.Store.DefaultConfPath()); err == nil {
 		defLimits = config.ApplyKV(defLimits, kv)
 	}
+	defLimits, _ = defLimits.ClampPenaltyUpperBounds()
 
 	pkgNames := make(map[string]struct{})
 	userCounts := make(map[string]int)
@@ -872,6 +1138,7 @@ func (e *Engine) listPackagesData() (ipc.PackagesData, error) {
 				hasCustom = true
 			}
 		}
+		lim, _ = lim.ClampPenaltyUpperBounds()
 		items = append(items, ipc.PackageConfigItem{
 			Package:       p,
 			HasCustomFile: hasCustom,
@@ -886,12 +1153,14 @@ func (e *Engine) listPackagesData() (ipc.PackagesData, error) {
 	}, nil
 }
 
-func (e *Engine) handleGetUpdaterStatus(ctx context.Context) ipc.Response {
+func (e *Engine) handleGetUpdaterStatus(ctx context.Context, peerUID uint32) ipc.Response {
+	canManage := (peerUID == 0)
 	if e.Updater != nil {
 		st, err := e.Updater.GetStatus(ctx)
 		if err != nil {
 			return ipc.Response{OK: false, Error: err.Error()}
 		}
+		st.CanManageUpdater = canManage
 		return ipc.Response{OK: true, Data: st}
 	}
 
@@ -907,6 +1176,7 @@ func (e *Engine) handleGetUpdaterStatus(ctx context.Context) ipc.Response {
 			RepoPinned:        !cfg.AllowCustomRepo,
 			SignatureRequired: version.DefaultReleasePublicKeyHex != "",
 			RootOnlyActions:   true,
+			CanManageUpdater:  canManage,
 			HasToken:          cfg.GitHubToken != "",
 			MaskedToken:       cfg.MaskedToken(),
 			UpdateChannel:     cfg.UpdateChannel,
@@ -951,6 +1221,7 @@ func readLinesList(path string) []string {
 
 	var out []string
 	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line != "" && !strings.HasPrefix(line, "#") {
@@ -968,6 +1239,7 @@ func lookupUserUID(passwdPath, username string) uint32 {
 	defer f.Close()
 
 	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
 		parts := strings.Split(sc.Text(), ":")
 		if len(parts) >= 3 && parts[0] == username {
@@ -987,6 +1259,7 @@ func lookupUsernameByUID(passwdPath string, targetUID uint32) string {
 	defer f.Close()
 
 	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
 		parts := strings.Split(sc.Text(), ":")
 		if len(parts) >= 3 {

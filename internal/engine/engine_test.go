@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/shostwp-byte/da-resourcelimiter/internal/cgroup"
 	"github.com/shostwp-byte/da-resourcelimiter/internal/config"
@@ -104,14 +106,31 @@ func TestEngineSecurityUpdaterLockDBOwnershipAndOrphanCleanup(t *testing.T) {
 		t.Fatalf("SaveUserLimits bob as DA admin (UID 1001) failed: %+v", resp)
 	}
 
-	for _, rootOnlyAct := range []string{ipc.ActionSaveUpdaterConfig, ipc.ActionTriggerUpdate, ipc.ActionRollbackUpdate} {
-		denied := eng.HandleAdminRequest(context.Background(), 1001, ipc.Request{Action: rootOnlyAct})
-		if denied.OK {
-			t.Fatalf("expected secondary DA admin UID 1001 to be blocked from %s (S1), got %+v", rootOnlyAct, denied)
+	// Verify BOTH secondary DA admin (UID 1001) AND diradmin Web CGI (UID 995) are blocked from updater mutations (N11),
+	// while still receiving read-only updater status with CanManageUpdater=false.
+	diradminStatus := eng.HandleAdminRequest(context.Background(), 995, ipc.Request{Action: ipc.ActionGetUpdaterStatus})
+	if !diradminStatus.OK {
+		t.Fatalf("GetUpdaterStatus as diradmin failed: %+v", diradminStatus)
+	}
+	if st, ok := diradminStatus.Data.(ipc.UpdaterStatusData); !ok || st.CanManageUpdater {
+		t.Fatalf("expected CanManageUpdater=false for diradmin UID 995 (N11), got %+v", diradminStatus.Data)
+	}
+
+	rootStatus := eng.HandleAdminRequest(context.Background(), 0, ipc.Request{Action: ipc.ActionGetUpdaterStatus})
+	if st, ok := rootStatus.Data.(ipc.UpdaterStatusData); !ok || !st.CanManageUpdater {
+		t.Fatalf("expected CanManageUpdater=true for root UID 0 (N11), got %+v", rootStatus.Data)
+	}
+
+	for _, nonRootUID := range []uint32{1001, 995} {
+		for _, rootOnlyAct := range []string{ipc.ActionSaveUpdaterConfig, ipc.ActionTriggerUpdate, ipc.ActionRollbackUpdate} {
+			denied := eng.HandleAdminRequest(context.Background(), nonRootUID, ipc.Request{Action: rootOnlyAct})
+			if denied.OK {
+				t.Fatalf("expected UID %d to be blocked from %s (N11), got %+v", nonRootUID, rootOnlyAct, denied)
+			}
 		}
 	}
 
-	// Verify root (UID 0) and diradmin (UID 995) CAN run updater actions, EXCEPT changing github_repo over IPC (S1)
+	// Verify root (UID 0) CAN run updater actions, EXCEPT changing github_repo over IPC (S1, N11)
 	repoChangeAttempt := eng.HandleAdminRequest(context.Background(), 0, ipc.Request{
 		Action:          ipc.ActionSaveUpdaterConfig,
 		GitHubRepo:      "attacker/evilrepo",
@@ -120,14 +139,14 @@ func TestEngineSecurityUpdaterLockDBOwnershipAndOrphanCleanup(t *testing.T) {
 	if repoChangeAttempt.OK {
 		t.Fatalf("expected changing github_repo over IPC to be rejected even for root (S1)")
 	}
-	validRootSave := eng.HandleAdminRequest(context.Background(), 995, ipc.Request{
+	validRootSave := eng.HandleAdminRequest(context.Background(), 0, ipc.Request{
 		Action:          ipc.ActionSaveUpdaterConfig,
 		UpdateChannel:   "stable",
 		BackupRetention: 5,
 		KeepStoredToken: true,
 	})
 	if !validRootSave.OK {
-		t.Fatalf("expected diradmin UID 995 to save token/channel config: %+v", validRootSave)
+		t.Fatalf("expected root UID 0 to save token/channel config: %+v", validRootSave)
 	}
 	rootTrigger := eng.HandleAdminRequest(context.Background(), 0, ipc.Request{Action: ipc.ActionTriggerUpdate})
 	if !rootTrigger.OK {
@@ -196,4 +215,96 @@ func TestEngineSecurityUpdaterLockDBOwnershipAndOrphanCleanup(t *testing.T) {
 	if !ok || portal.Snapshot.Username != "alice" {
 		t.Fatalf("tenant isolation breach: UID 1005 got %+v", userResp.Data)
 	}
+}
+
+func TestApplyLockContextCancelAndCoalescingBackgroundWorker(t *testing.T) {
+	tmp := t.TempDir()
+	dataDir := filepath.Join(tmp, "plugin_data")
+	daRoot := filepath.Join(tmp, "da_data")
+	daUsersDir := filepath.Join(daRoot, "users")
+	passwdPath := filepath.Join(tmp, "passwd")
+
+	_ = os.WriteFile(passwdPath, []byte("alice:x:1005:1005::/home/alice:/bin/bash\nbob:x:1006:1006::/home/bob:/bin/bash\n"), 0o644)
+	for _, u := range []string{"alice", "bob"} {
+		_ = os.MkdirAll(filepath.Join(daUsersDir, u), 0o755)
+		_ = os.WriteFile(filepath.Join(daUsersDir, u, "user.conf"), []byte("usertype=user\npackage=gold\n"), 0o600)
+	}
+
+	store := config.NewStore(dataDir, filepath.Join(tmp, "updater.conf"))
+	reg := dausers.NewRegistry(daUsersDir, passwdPath)
+	_ = reg.Reload()
+	cgMgr := cgroup.NewManager(filepath.Join(tmp, "systemd"), filepath.Join(tmp, "cgroup"), noopCmdRunner{})
+
+	eng := New(store, reg, cgMgr, nil, nil, nil, daRoot, passwdPath)
+	eng.AsyncSyncThreshold = 1 // Force background sync queue when >1 user
+
+	// 1. N9a: acquireApplyLock respects context deadline when semaphore is already held
+	release, err := eng.acquireApplyLock(context.Background())
+	if err != nil {
+		t.Fatalf("acquireApplyLock #1: %v", err)
+	}
+
+	shortCtx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	if err := eng.ApplyUser(shortCtx, "alice"); err == nil || !strings.Contains(err.Error(), "context deadline exceeded") {
+		release()
+		t.Fatalf("expected ApplyUser to abort on context deadline while lock is held (N9a), got err=%v", err)
+	}
+
+	// 2. N9c: StartBackgroundWorker coalesces rapid SavePackageLimits + SaveDefaultLimits while lock is held!
+	workerCtx, stopWorker := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	eng.StartBackgroundWorker(workerCtx, &wg)
+
+	lim := config.DefaultLimits()
+	lim.CPUQuota = 250
+	for i := 0; i < 5; i++ {
+		r := eng.HandleAdminRequest(context.Background(), 0, ipc.Request{
+			Action:    ipc.ActionSavePackageLimits,
+			Package:   "gold",
+			SyncUsers: true,
+			Limits:    &lim,
+		})
+		if !r.OK {
+			release()
+			stopWorker()
+			t.Fatalf("SavePackageLimits #%d: %+v", i, r)
+		}
+	}
+	lim.CPUQuota = 300
+	rDef := eng.HandleAdminRequest(context.Background(), 0, ipc.Request{
+		Action:    ipc.ActionSaveDefaultLimits,
+		SyncUsers: true,
+		Limits:    &lim,
+	})
+	if !rDef.OK {
+		release()
+		stopWorker()
+		t.Fatalf("SaveDefaultLimits: %+v", rDef)
+	}
+
+	if inProg, _ := eng.SyncStatus(); !inProg {
+		release()
+		stopWorker()
+		t.Fatal("expected SyncStatus() == true while background job is queued behind applySem (N9c)")
+	}
+
+	// Release semaphore so the coalesced background worker drains cleanly
+	release()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		inProg, _ := eng.SyncStatus()
+		if !inProg {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if inProg, lbl := eng.SyncStatus(); inProg {
+		stopWorker()
+		t.Fatalf("expected background sync queue to finish draining, still running (%s)", lbl)
+	}
+
+	stopWorker()
+	wg.Wait()
 }

@@ -22,27 +22,29 @@
 
 ---
 
-## Cài đặt Xác thực theo Tag Phát hành (`v1.0.4.1`)
+## Cài đặt Xác thực theo Tag Phát hành (`v1.0.4.2`)
 
-Chạy dưới quyền `root` trên máy chủ DirectAdmin. Để đảm bảo an toàn chuỗi cung ứng (tránh thực thi trực tiếp script chưa kiểm chứng từ nhánh `main` và không làm lộ `GITHUB_TOKEN` trong `/proc/<pid>/cmdline`), hãy tải gói phát hành đã ghim tag và kiểm tra `SHA-256` trước khi cài đặt:
+Chạy dưới quyền `root` trên máy chủ DirectAdmin. Để đảm bảo an toàn chuỗi cung ứng (tránh thực thi trực tiếp script chưa kiểm chứng từ nhánh `main` và không làm lộ `GITHUB_TOKEN` trong `/proc/<pid>/cmdline`), hãy tải gói phát hành đã ghim tag, xác thực chữ ký số **Ed25519** (`checksums.txt.sig`) + `SHA-256` trước khi giải nén và cài đặt:
 
 ```bash
-# 1. Cài đặt từ Public GitHub Release (ghim tag v1.0.4.1 & kiểm tra SHA-256):
-VER="v1.0.4.1"
+# 1. Cài đặt từ Public GitHub Release (ghim tag v1.0.4.2 & xác thực Ed25519 + SHA-256 trước khi giải nén):
+VER="v1.0.4.2"
 ARCH="$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
 TMP_DIR="$(mktemp -d /tmp/da-limiter.XXXXXX)" && chmod 0700 "$TMP_DIR"
 curl -fsSL "https://github.com/shostwp-byte/da-resourcelimiter/releases/download/${VER}/checksums.txt" -o "${TMP_DIR}/checksums.txt"
+curl -fsSL "https://github.com/shostwp-byte/da-resourcelimiter/releases/download/${VER}/checksums.txt.sig" -o "${TMP_DIR}/checksums.txt.sig"
 curl -fsSL "https://github.com/shostwp-byte/da-resourcelimiter/releases/download/${VER}/da-resource-limiter-linux-${ARCH}.tar.gz" -o "${TMP_DIR}/da-resource-limiter-linux-${ARCH}.tar.gz"
 (cd "$TMP_DIR" && grep " da-resource-limiter-linux-${ARCH}\.tar\.gz$" checksums.txt | sha256sum -c -)
 tar -xzf "${TMP_DIR}/da-resource-limiter-linux-${ARCH}.tar.gz" -C "$TMP_DIR"
+"${TMP_DIR}/da-resource-limiter/bin/da-resourced" verify "${TMP_DIR}/checksums.txt" "${TMP_DIR}/checksums.txt.sig"
 "${TMP_DIR}/da-resource-limiter/scripts/install.sh"
 rm -rf "$TMP_DIR"
 ```
 
 ```bash
-# 2. Cài đặt từ Private GitHub Repository (truyền GITHUB_TOKEN qua stdin `curl -K -`, không lộ trên `ps`):
+# 2. Cài đặt từ Private GitHub Repository (truyền GITHUB_TOKEN qua stdin `curl -K -`, tự xác thực Ed25519 trước khi giải nén):
 export GITHUB_TOKEN="github_pat_XXXXXXXXXXXXXXXXXXXX"
-export TARGET_VERSION="v1.0.4.1"
+export TARGET_VERSION="v1.0.4.2"
 TMP_INST="$(mktemp /tmp/da-install.XXXXXX.sh)" && chmod 0700 "$TMP_INST"
 printf 'header = "Authorization: Bearer %s"\n' "$GITHUB_TOKEN" | \
   curl -fsSL -K - "https://raw.githubusercontent.com/shostwp-byte/da-resourcelimiter/${TARGET_VERSION}/scripts/install.sh" -o "$TMP_INST"
@@ -72,13 +74,13 @@ Sau khi cài đặt hoàn tất:
    - Đồng bộ biến `DA_PHP_MAX_CHILDREN` và `DA_PHP_MEM_LIMIT` vào `user.conf` với khoá file `flock` và bảo toàn quyền sở hữu `diradmin:diradmin` (`0600`).
 3. **MariaDB 3-Tier Governor & Penalty Box:**
    - **Lớp 1:** Kiểm toán bộ đệm per-thread `/etc/my.cnf` (`da-resourced audit-mycnf`).
-   - **Lớp 2:** Đồng bộ gộp lô (`Batch ALTER USER`) `MAX_USER_CONNECTIONS` và `MAX_STATEMENT_TIME` an toàn qua `--defaults-extra-file` (`0600`) kèm timeout truy vấn cứng `5s`.
-   - **Lớp 3:** Watchdog độc lập `1.5s` đọc `MEMORY_USED` trên `information_schema.PROCESSLIST`, ánh xạ chủ sở hữu theo *Longest-Prefix Match*, tự động `KILL QUERY` vượt ngưỡng và đưa tài khoản vi phạm lặp lại vào **Penalty Box** (validate đầy đủ ngưỡng phạt `>= 1`).
+   - **Lớp 2:** Đồng bộ gộp lô chia trang (`Chunked Batch ALTER USER --force`) `MAX_USER_CONNECTIONS` và `MAX_STATEMENT_TIME` an toàn qua `--defaults-extra-file` (`0600`).
+   - **Lớp 3:** Watchdog độc lập `1.5s` đọc `MEMORY_USED` trên `information_schema.PROCESSLIST` (tính các kết nối đang thực thi truy vấn `Command IN ('Query', 'Execute')`), ánh xạ chủ sở hữu theo *Longest-Prefix Match*, tự động `KILL QUERY` vượt ngưỡng và đưa tài khoản vi phạm lặp lại vào **Penalty Box**.
 4. **Dual Unix Socket, `SO_PEERCRED` Pre-Decode & Chống CSRF:**
-   - **Admin Socket (`/var/run/da-resourced.sock`):** Kiểm tra `SO_PEERCRED` ngay trước khi giải mã JSON, giới hạn kết nối đồng thời, kết hợp kiểm tra `Origin`/`Referer`/`Sec-Fetch-Site` và mã HMAC `csrf_token` trên `admin/api.php`.
-   - **User Socket (`/var/run/da-resourced-user.sock`):** Giới hạn kết nối + tần suất theo từng UID (Sliding-Window Rate Limit), đọc ngược file JSONL theo khối 32 KB chống ngốn RAM và khoá chặt mỗi tài khoản chỉ đọc được dữ liệu của chính UID đang gọi.
+   - **Admin Socket (`/var/run/da-resourced.sock`):** Kiểm tra `SO_PEERCRED` ngay trước khi giải mã JSON, giới hạn kết nối đồng thời, kết hợp kiểm tra `Origin`/`Referer`/`Sec-Fetch-Site` (hỗ trợ proxy qua `DA_LIMITER_ALLOWED_HOSTS` / `/etc/da-resourced/web.conf`) và mã HMAC `csrf_token` theo UID thực (`/proc/self/status`) trên `admin/api.php`.
+   - **User Socket (`/var/run/da-resourced-user.sock`):** Giới hạn kết nối đồng thời + tần suất theo từng UID, đọc ngược file JSONL theo khối 32 KB dừng sớm tại mốc 24h và khoá chặt mỗi tài khoản chỉ đọc được dữ liệu của chính UID đang gọi.
 5. **Cập nhật Nguyên tử Ký số Ed25519 từ GitHub Releases:**
-   - Ghim cứng repository cập nhật chính thức, bắt buộc xác thực chữ ký số **Ed25519** (`checksums.txt.sig`) + mã băm **SHA-256** trước khi giải nén, khoá quyền cập nhật cho `root`/`diradmin`, tạo Snapshot Backup tại `/var/backups/da-resource-limiter/`, bảo toàn `plugin/data/` và tự động **Rollback** nếu Daemon mới lỗi.
+   - Ghim cứng repository cập nhật chính thức (nếu dùng mirror riêng cần khai báo `ALLOW_CUSTOM_REPO=yes` trong `/etc/da-resourced/updater.conf` và vẫn bắt buộc khớp khoá ký số), xác thực chữ ký **Ed25519** (`checksums.txt.sig`) + **SHA-256** + đối chiếu phiên bản `manifest.json`/`plugin.conf` chống phát lại gói cũ, khoá chặt quyền thực thi cập nhật cho `root` CLI (`UID 0`), tạo Snapshot Backup tại `/var/backups/da-resource-limiter/`, bảo toàn `plugin/data/` và tự động **Rollback** (cả khi lỗi giữa chừng hoặc lỗi healthcheck).
 
 ---
 

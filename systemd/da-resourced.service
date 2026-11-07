@@ -17,13 +17,13 @@ OOMScoreAdjust=-900
 LimitNOFILE=65535
 UMask=0022
 
-# Systemd sandboxing & privilege hardening (preserving cgroup v2, systemd slice & DA access)
+# Systemd sandboxing & privilege hardening (preserving cgroup v2 write access & /tmp/mysql.sock visibility — N7)
 NoNewPrivileges=yes
-PrivateTmp=yes
+RuntimeDirectory=da-resourced
+RuntimeDirectoryMode=0700
 ProtectHome=read-only
-ReadWritePaths=-/home/mysql
+ReadWritePaths=-/sys/fs/cgroup -/home/mysql
 ProtectKernelModules=yes
-ProtectKernelTunables=yes
 ProtectKernelLogs=yes
 ProtectClock=yes
 ProtectControlGroups=no

@@ -4,6 +4,7 @@
 # Preserves 100% of customer/package configuration files in plugin/data/.
 
 set -euo pipefail
+shopt -s inherit_errexit 2>/dev/null || true
 
 MODE="${1:-}"
 STAGE_DIR="${2:-}"
@@ -264,6 +265,38 @@ case "$MODE" in
 
         write_status "running" "Creating pre-update snapshot backup..." "$TARGET_VER"
         SNAP_FILE=$(create_snapshot_backup)
+        if [[ -z "$SNAP_FILE" || ! -s "$SNAP_FILE" ]]; then
+            cleanup_stage_dir "$STAGE_DIR"
+            write_status "failed" "Pre-update snapshot backup failed or produced empty archive" "$TARGET_VER"
+            echo "Refusing deploy because snapshot backup failed." >&2
+            exit 1
+        fi
+
+        # Arm EXIT trap so any mid-deploy command failure under `set -e` automatically restores SNAP_FILE
+        # and transitions update_status.json out of "running" (N18).
+        APPLY_COMPLETED="no"
+        ROLLBACK_SNAP="$SNAP_FILE"
+        # shellcheck disable=SC2329
+        on_apply_unexpected_exit() {
+            local rc=$?
+            trap - EXIT
+            if [[ "${APPLY_COMPLETED:-no}" == "yes" ]]; then
+                return 0
+            fi
+            cleanup_stage_dir "$STAGE_DIR"
+            if [[ -n "${ROLLBACK_SNAP:-}" && -s "${ROLLBACK_SNAP:-}" ]]; then
+                write_status "running" "Unexpected error during deploy (exit ${rc}); restoring snapshot..." "$TARGET_VER" || true
+                if restore_snapshot_archive "$ROLLBACK_SNAP" && healthcheck_daemon; then
+                    write_status "rolled_back" "Deploy aborted mid-flight (exit ${rc}); automatically rolled back to previous working snapshot." "$TARGET_VER" || true
+                else
+                    write_status "failed" "Deploy aborted mid-flight (exit ${rc}) and automatic rollback encountered errors. Check journalctl -u da-resourced." "$TARGET_VER" || true
+                fi
+            else
+                write_status "failed" "Update aborted unexpectedly (exit ${rc})." "$TARGET_VER" || true
+            fi
+            exit "$rc"
+        }
+        trap 'on_apply_unexpected_exit' EXIT
 
         write_status "running" "Deploying binary, Evolution UI & DirectAdmin hooks (preserving data/)..." "$TARGET_VER"
         mkdir -p "$PLUGIN_DEST" "${PLUGIN_DEST}/scripts" "${PLUGIN_DEST}/data/packages" "${PLUGIN_DEST}/data/users"
@@ -304,11 +337,15 @@ case "$MODE" in
         write_status "running" "Restarting da-resourced & running 10s socket healthcheck..." "$TARGET_VER"
         systemctl daemon-reload
         if systemctl restart da-resourced && healthcheck_daemon; then
+            APPLY_COMPLETED="yes"
+            trap - EXIT
             cleanup_stage_dir "$STAGE_DIR"
             write_status "success" "Successfully updated to ${TARGET_VER} (snapshot saved at ${SNAP_FILE})" "$TARGET_VER"
             echo "Update to ${TARGET_VER} succeeded."
             exit 0
         else
+            APPLY_COMPLETED="yes"
+            trap - EXIT
             cleanup_stage_dir "$STAGE_DIR"
             write_status "running" "Healthcheck failed for ${TARGET_VER}; executing automatic rollback..." "$TARGET_VER"
             if restore_snapshot_archive "$SNAP_FILE" && healthcheck_daemon; then

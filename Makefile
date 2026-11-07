@@ -1,6 +1,6 @@
 BINARY_NAME := da-resourced
 MODULE      := github.com/shostwp-byte/da-resourcelimiter
-CONF_VER    := $(shell awk -F= '/^version=/{print "v"$$2}' plugin/plugin.conf 2>/dev/null || echo "v1.0.4.1")
+CONF_VER    := $(shell awk -F= '/^version=/{print "v"$$2}' plugin/plugin.conf 2>/dev/null || echo "v1.0.4.2")
 VERSION     ?= $(CONF_VER)
 COMMIT      ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "none")
 BUILD_TIME  ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "unknown")

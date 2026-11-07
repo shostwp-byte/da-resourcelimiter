@@ -387,6 +387,7 @@ cat <<'DARL_ADMIN_HTML'
         <h2 class="darl-title">
           <span>DA Resource Limiter</span>
           <span id="darl-daemon-badge" class="darl-badge darl-badge-info">Đang kết nối...</span>
+          <span id="darl-sync-badge" class="darl-badge darl-badge-warn" style="display:none;">Đang đồng bộ...</span>
         </h2>
         <div id="darl-daemon-meta" style="font-size:12.5px;color:var(--muted);margin-top:4px;">
           Cgroups v2 + PHP-FPM/LSPHP Scope + MariaDB 3-Tier Governor
@@ -580,12 +581,23 @@ cat <<'DARL_ADMIN_HTML'
     <div class="darl-card">
       <h3 style="margin:0 0 10px 0;font-size:15.5px;">Kiểm tra &amp; Cập nhật từ GitHub Releases (Ed25519 + SHA-256 Verified)</h3>
       <div style="font-size:12.5px;color:var(--text-soft);background:#f8fafc;border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:12px;line-height:1.5;">
-        <strong>Chính sách Bảo mật Root:</strong> Nguồn cập nhật được ghim cứng vào repository chính thức và bắt buộc xác thực chữ ký số <strong>Ed25519</strong> trước khi thực thi. Các thao tác cập nhật/khôi phục cấp hệ thống chỉ cho phép tiến trình <code class="darl-mono">root</code> / <code class="darl-mono">diradmin</code> (hoặc chạy trực tiếp qua SSH root: <code class="darl-mono">da-resourced update</code> / <code class="darl-mono">da-resourced rollback</code>).
+        <strong>Chính sách Bảo mật Root (N11):</strong> Nguồn cập nhật được ghim cứng vào repository chính thức và bắt buộc xác thực chữ ký số <strong>Ed25519</strong> trước khi thực thi. Do DirectAdmin chạy tiến trình Web CGI dưới quyền chung <code class="darl-mono">diradmin</code> cho mọi tài khoản quản trị, các thao tác thay đổi cấu hình Updater / tự cập nhật / khôi phục hệ thống chỉ cho phép thực thi trực tiếp dưới quyền <code class="darl-mono">root</code> (UID 0) qua SSH CLI.
       </div>
       <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:12px;">
-        <button type="button" class="darl-btn darl-btn-outline" id="btn-upd-check">Check for Updates</button>
-        <button type="button" class="darl-btn darl-btn-primary" id="btn-upd-trigger">One-Click Update Now</button>
-        <button type="button" class="darl-btn darl-btn-danger" id="btn-upd-rollback">Rollback Snapshot Trước</button>
+        <button type="button" class="darl-btn darl-btn-primary" id="btn-upd-check">Check for Updates</button>
+        <button type="button" class="darl-btn darl-btn-outline" id="btn-upd-trigger" disabled title="Chạy lệnh `da-resourced update` dưới quyền root qua SSH">One-Click Update (Root CLI Only)</button>
+        <button type="button" class="darl-btn darl-btn-danger" id="btn-upd-rollback" disabled title="Chạy lệnh `da-resourced rollback` dưới quyền root qua SSH">Rollback Snapshot (Root CLI Only)</button>
+      </div>
+      <div id="upd-root-cli-box" style="margin-bottom:12px;">
+        <div style="font-size:12px;font-weight:600;color:var(--muted);margin-bottom:6px;">Lệnh Root SSH thực thi an toàn (Sao chép &amp; chạy với quyền root):</div>
+        <pre id="upd-root-cli-cmds" class="darl-pre" style="margin:0;"># Kiểm tra và cập nhật nguyên tử (xác thực Ed25519 + SHA-256 &amp; Auto-Rollback):
+da-resourced update
+
+# Khôi phục bản Snapshot Backup gần nhất:
+da-resourced rollback
+
+# Đổi kênh phát hành hoặc cập nhật GitHub Token qua stdin (không lộ trên ps):
+da-resourced config-updater --channel stable --retention 5</pre>
       </div>
       <div id="upd-notes-wrap" style="display:none;">
         <div style="font-size:12px;font-weight:600;color:var(--muted);margin-bottom:6px;">Release Notes / Thông tin tiến trình:</div>
@@ -623,7 +635,7 @@ cat <<'DARL_ADMIN_HTML'
         </label>
       </div>
       <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border);">
-        <button type="button" class="darl-btn darl-btn-primary" id="btn-upd-save">Lưu cấu hình GitHub Updater</button>
+        <button type="button" class="darl-btn darl-btn-outline" id="btn-upd-save" disabled title="Chạy lệnh `da-resourced config-updater` dưới quyền root qua SSH">Lưu cấu hình GitHub Updater (Root CLI Only)</button>
       </div>
     </div>
   </div>
@@ -796,7 +808,7 @@ cat <<'DARL_ADMIN_HTML'
         return csrfToken;
       }
 
-      async function callAPI(payload, usePost) {
+      async function callAPI(payload, usePost, isRetry) {
         const opts = { credentials: 'same-origin' };
         let url = API_URL;
         if (usePost) {
@@ -818,6 +830,14 @@ cat <<'DARL_ADMIN_HTML'
         const data = await res.json();
         if (data && typeof data.csrf_token === 'string' && data.csrf_token) {
           csrfToken = data.csrf_token;
+        }
+        // Automatically refresh expired CSRF token once on 403 so open admin tabs never lose form edits (N20d).
+        if (usePost && !isRetry && (res.status === 403 || (data && !data.ok && /csrf/i.test(data.error || '')))) {
+          csrfToken = '';
+          await ensureCsrfToken();
+          if (csrfToken) {
+            return callAPI(payload, true, true);
+          }
         }
         return data;
       }
@@ -875,6 +895,15 @@ cat <<'DARL_ADMIN_HTML'
           cachedUsers = r.data.users || [];
           badge.className = 'darl-badge darl-badge-ok';
           badge.textContent = 'ONLINE ' + d.version;
+          const syncBadge = document.getElementById('darl-sync-badge');
+          if (syncBadge) {
+            if (d.sync_in_progress) {
+              syncBadge.style.display = 'inline-flex';
+              syncBadge.textContent = 'Đang đồng bộ nền' + (d.sync_label ? ' (' + d.sync_label + ')' : '');
+            } else {
+              syncBadge.style.display = 'none';
+            }
+          }
           document.getElementById('darl-daemon-meta').textContent =
             'Uptime: ' + Math.floor(d.uptime_seconds / 60) + ' phút | Hosting Users: ' + d.managed_users + ' | Active Penalties: ' + d.active_penalties;
 
@@ -1100,6 +1129,25 @@ cat <<'DARL_ADMIN_HTML'
         document.getElementById('upd-repo').value = st.github_repo || 'shostwp-byte/da-resourcelimiter';
         document.getElementById('upd-channel').value = st.update_channel || 'stable';
         document.getElementById('upd-retention').value = String(st.backup_retention || 5);
+
+        const canManage = Boolean(st.can_manage_updater);
+        ['btn-upd-trigger', 'btn-upd-rollback', 'btn-upd-save', 'upd-token', 'upd-channel', 'upd-retention', 'upd-keep-token'].forEach(function (id) {
+          const el = document.getElementById(id);
+          if (el) el.disabled = !canManage;
+        });
+        const cliBox = document.getElementById('upd-root-cli-box');
+        if (cliBox) cliBox.style.display = canManage ? 'none' : 'block';
+        const cliPre = document.getElementById('upd-root-cli-cmds');
+        if (cliPre) {
+          const targetFlag = (st.update_available && st.latest_version) ? (' --version ' + st.latest_version) : '';
+          cliPre.textContent =
+            '# 1. Cập nhật nguyên tử từ GitHub Releases (Ed25519 + SHA-256 & Auto-Rollback):\n' +
+            'da-resourced update' + targetFlag + '\n\n' +
+            '# 2. Khôi phục bản Snapshot Backup gần nhất:\n' +
+            'da-resourced rollback\n\n' +
+            '# 3. Đổi kênh phát hành / số bản sao lưu (hoặc thêm --token-stdin cho Private Repo):\n' +
+            'da-resourced config-updater --channel ' + (st.update_channel || 'stable') + ' --retention ' + (st.backup_retention || 5);
+        }
 
         const notesParts = [];
         if (st.last_job_message) notesParts.push('[Update Job] ' + st.last_job_message);

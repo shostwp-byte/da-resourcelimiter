@@ -29,7 +29,20 @@ const (
 	DefaultMaxBackups = 3
 	reverseChunkBytes = 32 * 1024 // Read 32 KB blocks from end of file instead of loading full 10 MB into RAM (S5)
 	maxLineSafetyCap  = 1024 * 1024
+	countCacheTTL     = 3 * time.Second
 )
+
+type countCacheKey struct {
+	username string
+	bucket   int64 // unixCutoff rounded to 3-second bucket
+}
+
+type countCacheEntry struct {
+	oomCount     int
+	sqlKillCount int
+	penaltyCount int
+	expiresAt    time.Time
+}
 
 // ViolationLogger appends structured JSONL violation events with automatic size-based rotation.
 type ViolationLogger struct {
@@ -37,6 +50,9 @@ type ViolationLogger struct {
 	maxBytes   int64
 	maxBackups int
 	mu         sync.Mutex
+
+	countMu    sync.Mutex
+	countCache map[countCacheKey]countCacheEntry
 }
 
 func NewViolationLogger(path string, maxBytes int64, maxBackups int) *ViolationLogger {
@@ -53,6 +69,7 @@ func NewViolationLogger(path string, maxBytes int64, maxBackups int) *ViolationL
 		path:       path,
 		maxBytes:   maxBytes,
 		maxBackups: maxBackups,
+		countCache: make(map[countCacheKey]countCacheEntry),
 	}
 }
 
@@ -77,9 +94,8 @@ func (l *ViolationLogger) Log(entry ipc.ViolationEntry) error {
 	line = append(line, '\n')
 
 	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	if err := os.MkdirAll(filepath.Dir(l.path), 0o750); err != nil {
+		l.mu.Unlock()
 		return err
 	}
 
@@ -89,12 +105,27 @@ func (l *ViolationLogger) Log(entry ipc.ViolationEntry) error {
 
 	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
 	if err != nil {
+		l.mu.Unlock()
 		return err
 	}
-	defer f.Close()
+	_, writeErr := f.Write(line)
+	_ = f.Close()
+	l.mu.Unlock()
 
-	_, err = f.Write(line)
-	return err
+	if writeErr == nil && entry.Username != "" {
+		l.invalidateCountCache(entry.Username)
+	}
+	return writeErr
+}
+
+func (l *ViolationLogger) invalidateCountCache(username string) {
+	l.countMu.Lock()
+	for k := range l.countCache {
+		if k.username == username {
+			delete(l.countCache, k)
+		}
+	}
+	l.countMu.Unlock()
 }
 
 func (l *ViolationLogger) rotateLocked() error {
@@ -116,6 +147,31 @@ func (l *ViolationLogger) Query(username, violationType string, limit int) ([]ip
 	return l.querySince(username, violationType, limit, 0)
 }
 
+func (l *ViolationLogger) openSnapshotFiles() []*os.File {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	paths := make([]string, 0, l.maxBackups+1)
+	paths = append(paths, l.path)
+	for i := 1; i <= l.maxBackups; i++ {
+		paths = append(paths, fmt.Sprintf("%s.%d", l.path, i))
+	}
+
+	opened := make([]*os.File, 0, len(paths))
+	for _, p := range paths {
+		if f, err := os.Open(p); err == nil {
+			opened = append(opened, f)
+		}
+	}
+	return opened
+}
+
+func closeFiles(files []*os.File) {
+	for _, f := range files {
+		_ = f.Close()
+	}
+}
+
 func (l *ViolationLogger) querySince(username, violationType string, limit int, minTimestampUnix int64) ([]ipc.ViolationEntry, error) {
 	if limit <= 0 {
 		limit = 100
@@ -126,21 +182,14 @@ func (l *ViolationLogger) querySince(username, violationType string, limit int, 
 	username = strings.TrimSpace(username)
 	violationType = strings.TrimSpace(violationType)
 
-	l.mu.Lock()
-	files := make([]string, 0, l.maxBackups+1)
-	files = append(files, l.path)
-	for i := 1; i <= l.maxBackups; i++ {
-		files = append(files, fmt.Sprintf("%s.%d", l.path, i))
-	}
-	l.mu.Unlock()
+	// Open all log file descriptors under l.mu so concurrent rotation cannot cause duplicate inode reads (N16).
+	files := l.openSnapshotFiles()
+	defer closeFiles(files)
 
 	var collected []ipc.ViolationEntry
-	for _, filePath := range files {
-		entries, reachedCutoff, err := readMatchingFileReverseChunked(filePath, username, violationType, limit-len(collected), minTimestampUnix)
+	for _, f := range files {
+		entries, reachedCutoff, err := readMatchingOpenFileReverseChunked(f, username, violationType, limit-len(collected), minTimestampUnix)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
 			return collected, err
 		}
 		collected = append(collected, entries...)
@@ -153,6 +202,22 @@ func (l *ViolationLogger) querySince(username, violationType string, limit int, 
 
 // CountSince counts violations for a specific user since unixCutoff (used for 24h User UI summary).
 func (l *ViolationLogger) CountSince(username string, unixCutoff int64) (oomCount int, sqlKillCount int, penaltyCount int) {
+	username = strings.TrimSpace(username)
+	now := time.Now()
+	key := countCacheKey{
+		username: username,
+		bucket:   unixCutoff / 3,
+	}
+
+	l.countMu.Lock()
+	if l.countCache != nil {
+		if ent, ok := l.countCache[key]; ok && now.Before(ent.expiresAt) {
+			l.countMu.Unlock()
+			return ent.oomCount, ent.sqlKillCount, ent.penaltyCount
+		}
+	}
+	l.countMu.Unlock()
+
 	entries, err := l.querySince(username, "", 1000, unixCutoff)
 	if err != nil {
 		return 0, 0, 0
@@ -170,20 +235,57 @@ func (l *ViolationLogger) CountSince(username string, unixCutoff int64) (oomCoun
 			penaltyCount++
 		}
 	}
+
+	l.countMu.Lock()
+	if l.countCache == nil {
+		l.countCache = make(map[countCacheKey]countCacheEntry)
+	} else if len(l.countCache) > 512 {
+		for k, v := range l.countCache {
+			if !now.Before(v.expiresAt) {
+				delete(l.countCache, k)
+			}
+		}
+	}
+	l.countCache[key] = countCacheEntry{
+		oomCount:     oomCount,
+		sqlKillCount: sqlKillCount,
+		penaltyCount: penaltyCount,
+		expiresAt:    now.Add(countCacheTTL),
+	}
+	l.countMu.Unlock()
+
 	return oomCount, sqlKillCount, penaltyCount
 }
 
-// readMatchingFileReverseChunked reads JSONL files backwards from EOF in 32 KB blocks so
-// large 10 MB log files are never buffered wholly in memory (S5).
-func readMatchingFileReverseChunked(path, username, violationType string, needed int, minTimestampUnix int64) ([]ipc.ViolationEntry, bool, error) {
+var tsUnixFieldPrefix = []byte(`"timestamp_unix":`)
+
+// extractTimestampUnixFast parses "timestamp_unix":<int64> directly from raw JSONL bytes without heap allocation.
+func extractTimestampUnixFast(line []byte) (int64, bool) {
+	idx := bytes.Index(line, tsUnixFieldPrefix)
+	if idx < 0 {
+		return 0, false
+	}
+	rest := line[idx+len(tsUnixFieldPrefix):]
+	for len(rest) > 0 && (rest[0] == ' ' || rest[0] == '\t') {
+		rest = rest[1:]
+	}
+	if len(rest) == 0 || rest[0] < '0' || rest[0] > '9' {
+		return 0, false
+	}
+	var val int64
+	for len(rest) > 0 && rest[0] >= '0' && rest[0] <= '9' {
+		val = val*10 + int64(rest[0]-'0')
+		rest = rest[1:]
+	}
+	return val, val > 0
+}
+
+// readMatchingOpenFileReverseChunked reads an open JSONL file backwards from EOF in 32 KB blocks so
+// large 10 MB log files are never buffered wholly in memory (S5, N16).
+func readMatchingOpenFileReverseChunked(f *os.File, username, violationType string, needed int, minTimestampUnix int64) ([]ipc.ViolationEntry, bool, error) {
 	if needed <= 0 {
 		return nil, false, nil
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, false, err
-	}
-	defer f.Close()
 
 	st, err := f.Stat()
 	if err != nil {
@@ -206,7 +308,15 @@ func readMatchingFileReverseChunked(path, username, violationType string, needed
 		if len(trimmed) == 0 {
 			return false
 		}
-		// Fast substring pre-check before JSON unmarshal when filtering by a specific username
+		// Check minTimestampUnix BEFORE filtering by username so 24h scans stop immediately at the cutoff
+		// even when the queried user has zero violations in multi-file rotated logs (N16).
+		if minTimestampUnix > 0 {
+			if ts, ok := extractTimestampUnixFast(trimmed); ok && ts < minTimestampUnix {
+				reachedCutoff = true
+				return true
+			}
+		}
+		// Fast substring pre-check before full JSON unmarshal when filtering by a specific username
 		if username != "" && !bytes.Contains(trimmed, []byte(username)) {
 			return false
 		}

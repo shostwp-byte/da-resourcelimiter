@@ -194,7 +194,7 @@ func printUsage() {
 	fmt.Println("  da-resourced audit-mycnf [/etc/my.cnf]       Audit MariaDB Tier-1 per-thread memory settings")
 	fmt.Println("  da-resourced check-update                    Check GitHub Releases for newer version")
 	fmt.Println("  da-resourced config-updater [flags]          Update /etc/da-resourced/updater.conf as root")
-	fmt.Println("  da-resourced update [--version vX.Y.Z]       Download, verify Ed25519 + SHA-256 & atomically update")
+	fmt.Println("  da-resourced update [--version vX.Y.Z]       Download, verify Ed25519 + SHA-256 & atomically update (--allow-downgrade to force)")
 	fmt.Println("  da-resourced rollback                        Restore previous snapshot from /var/backups/da-resource-limiter")
 	fmt.Println("  da-resourced verify <file> [sigfile]         Verify Ed25519 detached signature against embedded public key")
 	fmt.Println("  da-resourced sign <file> [--out sigfile]     Sign file using RELEASE_SIGNING_PRIVATE_KEY env var")
@@ -276,6 +276,7 @@ func runServe(args []string) error {
 	defer signal.Stop(sighupCh)
 
 	var wg sync.WaitGroup
+	eng.StartBackgroundWorker(ctx, &wg)
 
 	// 1. Independent PHP-FPM / OpenLiteSpeed PID Classifier goroutine
 	wg.Add(1)
@@ -374,15 +375,19 @@ func runApplyUser(args []string) error {
 	if len(args) < 1 {
 		return errors.New("usage: da-resourced apply <username>")
 	}
-	if resp, err := ipc.SendRequest(context.Background(), ipc.DefaultAdminSocketPath, ipc.Request{
+	resp, err := ipc.SendRequest(context.Background(), ipc.DefaultAdminSocketPath, ipc.Request{
 		Action:   ipc.ActionApplyUserLimits,
 		Username: args[0],
-	}); err == nil {
+	})
+	if err == nil {
 		if !resp.OK {
 			return errors.New(resp.Error)
 		}
 		log.Println(resp.Message)
 		return nil
+	}
+	if !ipc.IsDialError(err) {
+		return fmt.Errorf("daemon IPC request failed (skipping local fallback while daemon is reachable): %w", err)
 	}
 
 	eng, _ := buildEngine()
@@ -410,15 +415,19 @@ func runApplyPackage(args []string) error {
 	if len(args) < 1 {
 		return errors.New("usage: da-resourced apply-package <package>")
 	}
-	if resp, err := ipc.SendRequest(context.Background(), ipc.DefaultAdminSocketPath, ipc.Request{
+	resp, err := ipc.SendRequest(context.Background(), ipc.DefaultAdminSocketPath, ipc.Request{
 		Action:  ipc.ActionApplyPackageLimits,
 		Package: args[0],
-	}); err == nil {
+	})
+	if err == nil {
 		if !resp.OK {
 			return errors.New(resp.Error)
 		}
 		log.Println(resp.Message)
 		return nil
+	}
+	if !ipc.IsDialError(err) {
+		return fmt.Errorf("daemon IPC request failed (skipping local fallback while daemon is reachable): %w", err)
 	}
 
 	eng, _ := buildEngine()
@@ -440,16 +449,20 @@ func runApplyDBUser(args []string) error {
 	if len(args) < 2 {
 		return errors.New("usage: da-resourced apply-db-user <da_username> <db_username>")
 	}
-	if resp, err := ipc.SendRequest(context.Background(), ipc.DefaultAdminSocketPath, ipc.Request{
+	resp, err := ipc.SendRequest(context.Background(), ipc.DefaultAdminSocketPath, ipc.Request{
 		Action:   ipc.ActionApplyDBUser,
 		Username: args[0],
 		DBUser:   args[1],
-	}); err == nil {
+	})
+	if err == nil {
 		if !resp.OK {
 			return errors.New(resp.Error)
 		}
 		log.Println(resp.Message)
 		return nil
+	}
+	if !ipc.IsDialError(err) {
+		return fmt.Errorf("daemon IPC request failed (skipping local fallback while daemon is reachable): %w", err)
 	}
 
 	eng, _ := buildEngine()
@@ -461,15 +474,19 @@ func runRemoveUser(args []string) error {
 	if len(args) < 1 {
 		return errors.New("usage: da-resourced remove <username>")
 	}
-	if resp, err := ipc.SendRequest(context.Background(), ipc.DefaultAdminSocketPath, ipc.Request{
+	resp, err := ipc.SendRequest(context.Background(), ipc.DefaultAdminSocketPath, ipc.Request{
 		Action:   ipc.ActionRemoveUser,
 		Username: args[0],
-	}); err == nil {
+	})
+	if err == nil {
 		if !resp.OK {
 			return errors.New(resp.Error)
 		}
 		log.Println(resp.Message)
 		return nil
+	}
+	if !ipc.IsDialError(err) {
+		return fmt.Errorf("daemon IPC request failed (skipping local fallback while daemon is reachable): %w", err)
 	}
 
 	eng, _ := buildEngine()
@@ -481,15 +498,19 @@ func runUnblock(args []string) error {
 	if len(args) < 1 {
 		return errors.New("usage: da-resourced unblock <username>")
 	}
-	if resp, err := ipc.SendRequest(context.Background(), ipc.DefaultAdminSocketPath, ipc.Request{
+	resp, err := ipc.SendRequest(context.Background(), ipc.DefaultAdminSocketPath, ipc.Request{
 		Action:   ipc.ActionUnblockPenalty,
 		Username: args[0],
-	}); err == nil {
+	})
+	if err == nil {
 		if !resp.OK {
 			return errors.New(resp.Error)
 		}
 		log.Println(resp.Message)
 		return nil
+	}
+	if !ipc.IsDialError(err) {
+		return fmt.Errorf("daemon IPC request failed (skipping local fallback while daemon is reachable): %w", err)
 	}
 
 	eng, _ := buildEngine()
@@ -637,12 +658,13 @@ func runConfigUpdater(args []string) error {
 
 func runUpdate(args []string) error {
 	fs := flag.NewFlagSet("update", flag.ContinueOnError)
-	targetVer := fs.String("version", "", "Optional specific release tag (e.g. v1.0.4.1); defaults to latest")
+	targetVer := fs.String("version", "", "Optional specific release tag (e.g. v1.0.4.2); defaults to latest")
+	allowDowngrade := fs.Bool("allow-downgrade", false, "Allow installing a release older than the currently running version")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	_, upd := buildEngine()
-	return upd.RunCLIUpdate(context.Background(), *targetVer)
+	return upd.RunCLIUpdateWithOptions(context.Background(), *targetVer, *allowDowngrade)
 }
 
 func runRollback() error {

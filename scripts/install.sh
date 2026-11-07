@@ -11,6 +11,9 @@ GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 TARGET_VERSION="${TARGET_VERSION:-latest}"
 FORCE_DB="${FORCE_DB:-no}"
 
+# Pinned 32-byte Ed25519 release-signing public key (must match DefaultReleasePublicKeyHex in internal/version/version.go) (N6).
+PINNED_ED25519_PUBKEY_HEX="0195c5127917180c22a76082e1746b1583142623a4602e6cc53b9788e7d8c6c5"
+
 BIN_DEST="/usr/local/sbin/da-resourced"
 PLUGIN_DEST="/usr/local/directadmin/plugins/da_resource_limiter"
 UPDATER_CONF="/etc/da-resourced/updater.conf"
@@ -42,11 +45,16 @@ check_prerequisites() {
 
     validate_inputs
 
+    if [[ "$GITHUB_REPO" != "shostwp-byte/da-resourcelimiter" ]]; then
+        warn "Custom GITHUB_REPO=${GITHUB_REPO} specified (ALLOW_CUSTOM_REPO=yes will be written to ${UPDATER_CONF})."
+        warn "Releases from ${GITHUB_REPO} MUST still carry a valid Ed25519 signature matching PINNED_ED25519_PUBKEY_HEX."
+    fi
+
     if [[ ! -d "/usr/local/directadmin" ]]; then
         fatal "DirectAdmin installation not found at /usr/local/directadmin."
     fi
 
-    # 1. Verify Linux Cgroups v2 Unified Hierarchy
+    # 1. Verify Linux Cgroups v2 Unified Hierarchy & writeability (N7)
     if [[ ! -f "/sys/fs/cgroup/cgroup.controllers" ]]; then
         printf '\n'
         warn "Linux Cgroups v2 (Unified Hierarchy) is NOT active on this server!"
@@ -56,15 +64,19 @@ check_prerequisites() {
         warn "  Add systemd.unified_cgroup_hierarchy=1 to GRUB_CMDLINE_LINUX in /etc/default/grub && update-grub && reboot"
         fatal "Aborting installation until Cgroups v2 is active."
     fi
-    ok "Detected Linux Cgroups v2 Unified Hierarchy (/sys/fs/cgroup/cgroup.controllers)."
+    if [[ ! -w "/sys/fs/cgroup" ]]; then
+        fatal "/sys/fs/cgroup is read-only on this host (container or restricted namespace); Cgroups v2 enforcement requires write access."
+    fi
+    ok "Detected writable Linux Cgroups v2 Unified Hierarchy (/sys/fs/cgroup)."
 
-    # 2. Verify MariaDB 10.5+ (MEMORY_USED column in information_schema.PROCESSLIST)
+    # 2. Verify MariaDB 10.5+ (MEMORY_USED column in information_schema.PROCESSLIST) & socket path (N7)
     local da_mycnf="/usr/local/directadmin/conf/my.cnf"
     if command -v mysql >/dev/null 2>&1 && [[ -f "$da_mycnf" ]]; then
-        local db_ver=""
+        local db_ver="" db_sock=""
         db_ver=$(mysql --defaults-extra-file="$da_mycnf" --connect-timeout=3 -N -B -e "SELECT VERSION();" 2>/dev/null || true)
+        db_sock=$(mysql --defaults-extra-file="$da_mycnf" --connect-timeout=3 -N -B -e "SELECT @@socket;" 2>/dev/null || true)
         if [[ -n "$db_ver" ]]; then
-            info "Detected Database Engine: ${db_ver}"
+            info "Detected Database Engine: ${db_ver} (socket: ${db_sock:-default})"
             if ! mysql --defaults-extra-file="$da_mycnf" --connect-timeout=3 -N -B -e "SELECT MEMORY_USED FROM information_schema.PROCESSLIST LIMIT 1;" >/dev/null 2>&1; then
                 if [[ "$FORCE_DB" != "yes" ]]; then
                     warn "Database does not expose information_schema.PROCESSLIST.MEMORY_USED (MariaDB 10.5+ recommended)."
@@ -163,6 +175,110 @@ download_github_asset() {
     fi
 }
 
+hex_to_raw() {
+    local clean="${1//[[:space:]]/}"
+    local len=${#clean}
+    local i out=""
+    for (( i = 0; i < len; i += 2 )); do
+        out+="\\x${clean:i:2}"
+    done
+    printf '%b' "$out"
+}
+
+# Verify detached Ed25519 signature over checksums.txt BEFORE downloading/extracting any archive,
+# using independent host crypto tools against PINNED_ED25519_PUBKEY_HEX (N6).
+verify_ed25519_signature_independent() {
+    local checksums_file="$1"
+    local sig_file="$2"
+    local work_dir="$3"
+
+    if [[ ! -s "$checksums_file" || ! -s "$sig_file" ]]; then
+        fatal "Missing or empty checksums.txt / checksums.txt.sig; refusing unverified bootstrap."
+    fi
+
+    local sig_hex
+    sig_hex=$(awk '{print $1; exit}' "$sig_file" | tr -d '\r\n[:space:]')
+    if [[ ! "$sig_hex" =~ ^[0-9A-Fa-f]{128}$ ]]; then
+        fatal "Malformed Ed25519 signature in checksums.txt.sig (expected 128 hex chars)."
+    fi
+
+    # 1. Primary verifier: OpenSSL 3.0+ (`pkeyutl -verify -rawin` with RFC 8410 Ed25519 SubjectPublicKeyInfo DER)
+    if command -v openssl >/dev/null 2>&1 && openssl pkeyutl -help 2>&1 | grep -q -- '-rawin'; then
+        local pub_pem="${work_dir}/pinned_ed25519_pub.pem"
+        local sig_raw="${work_dir}/checksums.sig.raw"
+        {
+            printf '%s\n' "-----BEGIN PUBLIC KEY-----"
+            hex_to_raw "302a300506032b6570032100${PINNED_ED25519_PUBKEY_HEX}" | base64 | tr -d '\r\n' | fold -w 64
+            printf '\n%s\n' "-----END PUBLIC KEY-----"
+        } > "$pub_pem"
+        hex_to_raw "$sig_hex" > "$sig_raw"
+        if openssl pkeyutl -verify -pubin -inkey "$pub_pem" -rawin -in "$checksums_file" -sigfile "$sig_raw" >/dev/null 2>&1; then
+            rm -f "$pub_pem" "$sig_raw"
+            ok "Ed25519 signature verified via OpenSSL against pinned public key."
+            return 0
+        fi
+        rm -f "$pub_pem" "$sig_raw"
+        fatal "Ed25519 signature verification FAILED (OpenSSL)! Refusing untrusted release."
+    fi
+
+    # 2. Fallback verifier: PHP CLI ext-sodium (standard on DirectAdmin CustomBuild servers)
+    if command -v php >/dev/null 2>&1; then
+        local php_rc=0
+        # shellcheck disable=SC2016
+        php -r '
+            if (!function_exists("sodium_crypto_sign_verify_detached")) { exit(2); }
+            $msg = file_get_contents($argv[1]);
+            $sig = hex2bin($argv[2]);
+            $pub = hex2bin($argv[3]);
+            if ($msg === false || $sig === false || $pub === false) { exit(1); }
+            exit(sodium_crypto_sign_verify_detached($sig, $msg, $pub) ? 0 : 1);
+        ' "$checksums_file" "$sig_hex" "$PINNED_ED25519_PUBKEY_HEX" >/dev/null 2>&1 || php_rc=$?
+        if [[ "$php_rc" -eq 0 ]]; then
+            ok "Ed25519 signature verified via PHP libsodium against pinned public key."
+            return 0
+        elif [[ "$php_rc" -eq 1 ]]; then
+            fatal "Ed25519 signature verification FAILED (PHP libsodium)! Refusing untrusted release."
+        fi
+    fi
+
+    # 3. Fallback verifier: Python 3 cryptography / PyNaCl
+    if command -v python3 >/dev/null 2>&1; then
+        local py_rc=0
+        python3 - "$checksums_file" "$sig_hex" "$PINNED_ED25519_PUBKEY_HEX" <<'PY' >/dev/null 2>&1 || py_rc=$?
+import sys
+msg = open(sys.argv[1], "rb").read()
+sig = bytes.fromhex(sys.argv[2])
+pub = bytes.fromhex(sys.argv[3])
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    try:
+        Ed25519PublicKey.from_public_bytes(pub).verify(sig, msg)
+        sys.exit(0)
+    except Exception:
+        sys.exit(1)
+except ImportError:
+    pass
+try:
+    from nacl.signing import VerifyKey
+    try:
+        VerifyKey(pub).verify(msg, sig)
+        sys.exit(0)
+    except Exception:
+        sys.exit(1)
+except ImportError:
+    sys.exit(2)
+PY
+        if [[ "$py_rc" -eq 0 ]]; then
+            ok "Ed25519 signature verified via Python against pinned public key."
+            return 0
+        elif [[ "$py_rc" -eq 1 ]]; then
+            fatal "Ed25519 signature verification FAILED (Python)! Refusing untrusted release."
+        fi
+    fi
+
+    fatal "Cannot verify Ed25519 release signature before extraction: install openssl >= 3.0, php-sodium, or python3-cryptography."
+}
+
 bootstrap_from_github() {
     local arch="$1"
     local work_dir="$2"
@@ -197,15 +313,19 @@ bootstrap_from_github() {
     if [[ -z "$archive_asset_url" || -z "$checksum_asset_url" ]]; then
         fatal "Could not locate ${archive_name} or checksums.txt in GitHub Release."
     fi
-
-    info "Downloading checksums.txt & ${archive_name}..."
-    download_github_asset "$checksum_asset_url" "${work_dir}/checksums.txt"
-    if [[ -n "$sig_asset_url" ]]; then
-        download_github_asset "$sig_asset_url" "${work_dir}/checksums.txt.sig"
+    if [[ -z "$sig_asset_url" ]]; then
+        fatal "Release is missing checksums.txt.sig (refusing unsigned release bootstrap)."
     fi
+
+    info "Downloading & verifying Ed25519 signature over checksums.txt before archive download..."
+    download_github_asset "$checksum_asset_url" "${work_dir}/checksums.txt"
+    download_github_asset "$sig_asset_url" "${work_dir}/checksums.txt.sig"
+    verify_ed25519_signature_independent "${work_dir}/checksums.txt" "${work_dir}/checksums.txt.sig" "$work_dir"
+
+    info "Downloading ${archive_name}..."
     download_github_asset "$archive_asset_url" "${work_dir}/${archive_name}"
 
-    info "Verifying SHA-256 checksum..."
+    info "Verifying SHA-256 checksum before extraction..."
     (
         cd "$work_dir"
         grep " ${archive_name}\$" checksums.txt | sha256sum -c -
@@ -214,12 +334,10 @@ bootstrap_from_github() {
 
     tar -xzf "${work_dir}/${archive_name}" -C "$work_dir"
 
-    if [[ -f "${work_dir}/checksums.txt.sig" ]]; then
-        info "Verifying Ed25519 release signature..."
-        "${work_dir}/da-resource-limiter/bin/da-resourced" verify \
-            "${work_dir}/checksums.txt" "${work_dir}/checksums.txt.sig"
-        ok "Ed25519 release signature verified."
-    fi
+    info "Running secondary embedded binary signature check..."
+    "${work_dir}/da-resource-limiter/bin/da-resourced" verify \
+        "${work_dir}/checksums.txt" "${work_dir}/checksums.txt.sig"
+    ok "Embedded binary Ed25519 verification passed."
 }
 
 update_token_in_conf() {
@@ -334,14 +452,21 @@ install_from_bundle() {
     mkdir -p "$(dirname "$UPDATER_CONF")"
     chmod 0700 "$(dirname "$UPDATER_CONF")"
     if [[ ! -f "$UPDATER_CONF" ]]; then
+        local allow_custom_line=""
+        if [[ "$GITHUB_REPO" != "shostwp-byte/da-resourcelimiter" ]]; then
+            allow_custom_line="ALLOW_CUSTOM_REPO=yes"
+        fi
         umask 077
-        cat <<EOF > "$UPDATER_CONF"
-# DA-ResourceLimiter GitHub Updater Configuration (0600 root:root)
-GITHUB_REPO=${GITHUB_REPO}
-GITHUB_TOKEN=${GITHUB_TOKEN}
-UPDATE_CHANNEL=stable
-BACKUP_RETENTION=5
-EOF
+        {
+            printf '%s\n' "# DA-ResourceLimiter GitHub Updater Configuration (0600 root:root)"
+            printf 'GITHUB_REPO=%s\n' "$GITHUB_REPO"
+            if [[ -n "$allow_custom_line" ]]; then
+                printf '%s\n' "$allow_custom_line"
+            fi
+            printf 'GITHUB_TOKEN=%s\n' "$GITHUB_TOKEN"
+            printf '%s\n' "UPDATE_CHANNEL=stable"
+            printf '%s\n' "BACKUP_RETENTION=5"
+        } > "$UPDATER_CONF"
         chmod 0600 "$UPDATER_CONF"
         chown root:root "$UPDATER_CONF"
         ok "Created GitHub Updater configuration at ${UPDATER_CONF}"

@@ -21,9 +21,9 @@ if [[ -n "$RAW_DB_USER" ]]; then
     else
         FULL_DB_USER="${DA_USER}_${RAW_DB_USER}"
     fi
-    timeout 8s "$DAEMON_BIN" apply-db-user "$DA_USER" "$FULL_DB_USER" >/dev/null 2>&1 || true
+    timeout 25s "$DAEMON_BIN" apply-db-user "$DA_USER" "$FULL_DB_USER" >/dev/null 2>&1 || true
 else
-    timeout 8s "$DAEMON_BIN" apply "$DA_USER" >/dev/null 2>&1 || true
+    timeout 25s "$DAEMON_BIN" apply "$DA_USER" >/dev/null 2>&1 || true
 fi
 
 exit 0

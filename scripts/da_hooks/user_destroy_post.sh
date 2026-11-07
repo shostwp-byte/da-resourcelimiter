@@ -11,5 +11,5 @@ if [[ -z "$TARGET_USER" || ! -x "$DAEMON_BIN" ]]; then
     exit 0
 fi
 
-timeout 10s "$DAEMON_BIN" remove "$TARGET_USER" >/dev/null 2>&1 || true
+timeout 25s "$DAEMON_BIN" remove "$TARGET_USER" >/dev/null 2>&1 || true
 exit 0

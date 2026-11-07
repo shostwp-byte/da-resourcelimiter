@@ -261,8 +261,21 @@ func (m *Manager) RemoveUserSlice(ctx context.Context, uid uint32) error {
 
 // PruneOrphanSlices scans SystemdSystemDir for managed user-<UID>.slice.d/50-da-limits.conf files
 // whose UID is no longer present in validUIDs (or whose embedded DA-User matches destroyedUser),
-// removes them, and triggers a single systemctl daemon-reload if any drop-in was deleted (R5).
+// removes them, and triggers a single systemctl daemon-reload if any drop-in was deleted (R5, N2).
 func (m *Manager) PruneOrphanSlices(ctx context.Context, validUIDs map[uint32]struct{}, destroyedUser string) (int, error) {
+	return m.PruneOrphanSlicesWithPolicy(ctx, validUIDs, destroyedUser, nil)
+}
+
+// PruneOrphanSlicesWithPolicy enforces N2 anti-regression guards during periodic untargeted sweeps:
+//  1. Never prunes when validUIDs is empty while managed drop-ins exist on disk.
+//  2. Trips a mass-deletion circuit breaker if >= 2 and > 20% of managed drop-ins disappear at once.
+//  3. Requires confirmOrphan(uid) (when provided) to verify absence from /etc/passwd or >= 2 reloads.
+func (m *Manager) PruneOrphanSlicesWithPolicy(
+	ctx context.Context,
+	validUIDs map[uint32]struct{},
+	destroyedUser string,
+	confirmOrphan func(uid uint32) bool,
+) (int, error) {
 	entries, err := os.ReadDir(m.SystemdSystemDir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -271,7 +284,12 @@ func (m *Manager) PruneOrphanSlices(ctx context.Context, validUIDs map[uint32]st
 		return 0, err
 	}
 
-	removed := 0
+	type managedSlice struct {
+		uid  uint32
+		text string
+	}
+	var managed []managedSlice
+
 	for _, ent := range entries {
 		if !ent.IsDir() {
 			continue
@@ -296,13 +314,49 @@ func (m *Manager) PruneOrphanSlices(ctx context.Context, validUIDs map[uint32]st
 		if !strings.HasPrefix(text, managedHeaderPrefix) {
 			continue
 		}
+		managed = append(managed, managedSlice{uid: uid, text: text})
+	}
 
-		_, stillActive := validUIDs[uid]
-		matchesDestroyed := destroyedUser != "" && strings.Contains(text, "# DA-User="+destroyedUser+"\n")
-		if stillActive && !matchesDestroyed {
-			continue
+	if len(managed) == 0 {
+		return 0, nil
+	}
+
+	var toRemove []uint32
+	if destroyedUser != "" {
+		marker := "# DA-User=" + destroyedUser + "\n"
+		for _, item := range managed {
+			_, stillActive := validUIDs[item.uid]
+			matchesDestroyed := strings.Contains(item.text, marker)
+			if matchesDestroyed {
+				toRemove = append(toRemove, item.uid)
+				continue
+			}
+			if !stillActive && (confirmOrphan == nil || confirmOrphan(item.uid)) {
+				toRemove = append(toRemove, item.uid)
+			}
 		}
+	} else {
+		if len(validUIDs) == 0 {
+			return 0, fmt.Errorf("aborted orphan slice prune: active UID registry is empty while %d managed slice drop-in(s) exist", len(managed))
+		}
+		var missing []uint32
+		for _, item := range managed {
+			if _, stillActive := validUIDs[item.uid]; !stillActive {
+				missing = append(missing, item.uid)
+			}
+		}
+		if len(missing) >= 2 && len(missing)*5 > len(managed) {
+			return 0, fmt.Errorf("aborted orphan slice prune: %d/%d (>20%%) managed slice drop-ins missing from registry", len(missing), len(managed))
+		}
+		for _, uid := range missing {
+			if confirmOrphan == nil || confirmOrphan(uid) {
+				toRemove = append(toRemove, uid)
+			}
+		}
+	}
 
+	removed := 0
+	for _, uid := range toRemove {
 		if changed, _ := m.removeDropInFile(uid); changed {
 			m.mu.Lock()
 			delete(m.cpuSamples, uid)

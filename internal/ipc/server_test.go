@@ -129,3 +129,106 @@ func TestServeConnPreDecodeAuthRateLimitAndIsolation(t *testing.T) {
 		t.Fatalf("unexpected coerced request fields: %+v", req)
 	}
 }
+
+type blockingUserHandler struct {
+	stubHandler
+	releaseCh chan struct{}
+	enteredCh chan struct{}
+}
+
+func (b *blockingUserHandler) HandleUserRequest(ctx context.Context, peerUID uint32, req Request) Response {
+	select {
+	case b.enteredCh <- struct{}{}:
+	default:
+	}
+	select {
+	case <-b.releaseCh:
+		return Response{OK: true, Data: map[string]interface{}{"peer_uid": peerUID, "action": req.Action}}
+	case <-ctx.Done():
+		return Response{OK: false, Error: "request context expired: " + ctx.Err().Error()}
+	}
+}
+
+func TestPerUIDConcurrentConnCapRequestTimeoutAndIsDialError(t *testing.T) {
+	// 1. N9b: IsDialError distinguishes socket dial failure from post-connect errors
+	_, dialErr := SendRequest(context.Background(), "/nonexistent/da-limiter-missing-test.sock", Request{Action: ActionPing})
+	if !IsDialError(dialErr) {
+		t.Fatalf("expected IsDialError=true for missing socket, got err=%v", dialErr)
+	}
+	if IsDialError(errors.New("daemon timeout")) {
+		t.Fatal("expected IsDialError=false for non-DialError")
+	}
+
+	// 2. N8: Per-UID concurrent user connection cap blocks 3rd simultaneous connection from UID 1005,
+	// while still permitting UID 1006 to connect!
+	bh := &blockingUserHandler{
+		releaseCh: make(chan struct{}),
+		enteredCh: make(chan struct{}, 8),
+	}
+	srv := NewServer("", "", bh)
+	srv.MaxPerUIDUserConns = 2
+	srv.UserRateLimitBurst = 50
+
+	var currentUID uint32 = 1005
+	srv.GetPeerUID = func(_ net.Conn) (uint32, error) {
+		return currentUID, nil
+	}
+
+	openHeldConn := func() net.Conn {
+		c, s := net.Pipe()
+		go srv.ServeConn(context.Background(), s, false)
+		_ = json.NewEncoder(c).Encode(Request{Action: ActionGetUserStats})
+		<-bh.enteredCh
+		return c
+	}
+
+	held1 := openHeldConn()
+	held2 := openHeldConn()
+
+	// 3rd simultaneous connection from UID 1005 must be rejected immediately
+	c3, s3 := net.Pipe()
+	go srv.ServeConn(context.Background(), s3, false)
+	var cappedResp Response
+	if err := json.NewDecoder(c3).Decode(&cappedResp); err != nil {
+		t.Fatalf("decode capped response: %v", err)
+	}
+	_ = c3.Close()
+	if cappedResp.OK || !strings.Contains(cappedResp.Error, "concurrent connections") {
+		t.Fatalf("expected per-UID concurrent cap rejection (N8), got %+v", cappedResp)
+	}
+
+	// Another customer UID (1006) MUST still be able to connect while UID 1005 holds 2 slots!
+	currentUID = 1006
+	cOther, sOther := net.Pipe()
+	go srv.ServeConn(context.Background(), sOther, false)
+	_ = json.NewEncoder(cOther).Encode(Request{Action: ActionGetUserStats})
+	<-bh.enteredCh
+
+	close(bh.releaseCh)
+	for _, conn := range []net.Conn{held1, held2, cOther} {
+		var r Response
+		_ = json.NewDecoder(conn).Decode(&r)
+		_ = conn.Close()
+	}
+
+	// 3. N9a: RequestTimeout cancels slow handler context
+	th := &blockingUserHandler{
+		releaseCh: make(chan struct{}),
+		enteredCh: make(chan struct{}, 2),
+	}
+	srvTimeout := NewServer("", "", th)
+	srvTimeout.RequestTimeout = 60 * time.Millisecond
+	srvTimeout.GetPeerUID = func(_ net.Conn) (uint32, error) { return 0, nil }
+
+	ct, st := net.Pipe()
+	go srvTimeout.ServeConn(context.Background(), st, false)
+	_ = json.NewEncoder(ct).Encode(Request{Action: ActionGetUserStats})
+	var timeoutResp Response
+	if err := json.NewDecoder(ct).Decode(&timeoutResp); err != nil {
+		t.Fatalf("decode timeout response: %v", err)
+	}
+	_ = ct.Close()
+	if timeoutResp.OK || !strings.Contains(timeoutResp.Error, "context deadline exceeded") {
+		t.Fatalf("expected per-request deadline cancellation (N9a), got %+v", timeoutResp)
+	}
+}

@@ -74,3 +74,67 @@ func TestRegistryReloadFiltersSystemUIDsAndResolvesDBUsers(t *testing.T) {
 		t.Fatal("expected da_admin to not resolve to a customer user")
 	}
 }
+
+func TestRegistryMissingDirRetainsSnapshotOrphanConfirmationAndConcurrency(t *testing.T) {
+	tmp := t.TempDir()
+	passwdFile := filepath.Join(tmp, "passwd")
+	daDir := filepath.Join(tmp, "users")
+
+	passwdContent := "" +
+		"alice:x:1005:1005:Alice:/home/alice:/bin/bash\n" +
+		"bob:x:1006:1006:Bob:/home/bob:/bin/bash\n"
+	if err := os.WriteFile(passwdFile, []byte(passwdContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Include >64KB line in alice/user.conf to verify 1 MB scanner buffer (N2)
+	_ = os.MkdirAll(filepath.Join(daDir, "alice"), 0o755)
+	_ = os.WriteFile(filepath.Join(daDir, "alice", "user.conf"), []byte("domains="+string(make([]byte, 80*1024))+"\nusertype=user\npackage=gold\n"), 0o640)
+	// Clean printable >64KB value
+	hugeDomains := make([]byte, 80*1024)
+	for i := range hugeDomains {
+		hugeDomains[i] = 'a'
+	}
+	_ = os.WriteFile(filepath.Join(daDir, "alice", "user.conf"), []byte("domains="+string(hugeDomains)+"\nusertype=user\npackage=gold\n"), 0o640)
+
+	_ = os.MkdirAll(filepath.Join(daDir, "bob"), 0o755)
+	_ = os.WriteFile(filepath.Join(daDir, "bob", "user.conf"), []byte("usertype=user\npackage=silver\n"), 0o640)
+
+	reg := NewRegistry(daDir, passwdFile)
+	if err := reg.Reload(); err != nil {
+		t.Fatalf("initial Reload: %v", err)
+	}
+	if reg.Count() != 2 {
+		t.Fatalf("expected 2 users, got %d", reg.Count())
+	}
+
+	// 1. N2: Transient disappearance of daUsersDir MUST return error AND preserve in-memory accounts!
+	movedDir := filepath.Join(tmp, "users_unmounted")
+	if err := os.Rename(daDir, movedDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Reload(); err == nil {
+		t.Fatal("expected Reload() to return error when daUsersDir is missing (N2)")
+	}
+	if reg.Count() != 2 {
+		t.Fatalf("expected Registry to retain 2 accounts on failed Reload (N2), got %d", reg.Count())
+	}
+	if err := os.Rename(movedDir, daDir); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. N2: Removing bob/user.conf while bob is STILL in /etc/passwd requires 2 consecutive reloads before CanPruneOrphanUID(1006) == true.
+	_ = os.RemoveAll(filepath.Join(daDir, "bob"))
+	if err := reg.Reload(); err != nil {
+		t.Fatalf("Reload #1 after bob dir removal: %v", err)
+	}
+	if reg.CanPruneOrphanUID(1006) {
+		t.Fatal("expected single missing reload while still in /etc/passwd to NOT allow orphan prune yet (N2)")
+	}
+	if err := reg.Reload(); err != nil {
+		t.Fatalf("Reload #2 after bob dir removal: %v", err)
+	}
+	if !reg.CanPruneOrphanUID(1006) {
+		t.Fatal("expected 2 consecutive missing reloads to confirm orphan UID 1006 (N2)")
+	}
+}

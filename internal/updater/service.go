@@ -74,6 +74,7 @@ type Service struct {
 	JobStatusPath       string
 	UpdateScript        string
 	Arch                string
+	CurrentVersion      string
 	ReleasePublicKeyHex string
 	LaunchDetached      DetachedLauncher
 
@@ -109,10 +110,18 @@ func NewService(store *config.Store) *Service {
 		JobStatusPath:       DefaultJobStatusPath,
 		UpdateScript:        DefaultUpdateScript,
 		Arch:                runtime.GOARCH,
+		CurrentVersion:      version.Version,
 		ReleasePublicKeyHex: version.DefaultReleasePublicKeyHex,
 	}
 	s.LaunchDetached = defaultSystemdRunLauncher
 	return s
+}
+
+func (s *Service) effectiveCurrentVersion() string {
+	if v := strings.TrimSpace(s.CurrentVersion); v != "" {
+		return v
+	}
+	return version.Version
 }
 
 func defaultSystemdRunLauncher(scriptPath string, args ...string) error {
@@ -157,9 +166,10 @@ func (s *Service) GetStatus(_ context.Context) (ipc.UpdaterStatusData, error) {
 		return ipc.UpdaterStatusData{}, err
 	}
 
+	curVer := s.effectiveCurrentVersion()
 	job := s.readJobStatus()
 	data := ipc.UpdaterStatusData{
-		CurrentVersion:    version.Version,
+		CurrentVersion:    curVer,
 		GitHubRepo:        cfg.GitHubRepo,
 		RepoPinned:        !cfg.AllowCustomRepo,
 		SignatureRequired: strings.TrimSpace(s.ReleasePublicKeyHex) != "",
@@ -179,7 +189,7 @@ func (s *Service) GetStatus(_ context.Context) (ipc.UpdaterStatusData, error) {
 
 	if rel != nil && sameTarget {
 		data.LatestVersion = rel.TagName
-		data.UpdateAvailable = IsNewerVersion(version.Version, rel.TagName)
+		data.UpdateAvailable = IsNewerVersion(curVer, rel.TagName)
 		data.ReleaseNotes = rel.Body
 		data.PublishedAt = rel.PublishedAt
 	}
@@ -217,10 +227,10 @@ func (s *Service) StageRelease(ctx context.Context, targetVersion string) (unpac
 	}
 	defer releaseOp()
 
-	return s.stageReleaseLocked(ctx, targetVersion)
+	return s.stageReleaseLocked(ctx, targetVersion, false)
 }
 
-func (s *Service) stageReleaseLocked(ctx context.Context, targetVersion string) (unpackedRoot string, resolvedTag string, retention int, err error) {
+func (s *Service) stageReleaseLocked(ctx context.Context, targetVersion string, allowDowngrade bool) (unpackedRoot string, resolvedTag string, retention int, err error) {
 	cfg, err := s.Store.LoadUpdaterConfig()
 	if err != nil {
 		return "", "", 0, err
@@ -238,8 +248,15 @@ func (s *Service) stageReleaseLocked(ctx context.Context, targetVersion string) 
 		return "", "", 0, err
 	}
 
+	curVer := s.effectiveCurrentVersion()
+	if !allowDowngrade && CompareSemVer(rel.TagName, curVer) < 0 {
+		err = fmt.Errorf("refusing downgrade from %s to %s (use 'da-resourced rollback' or '--allow-downgrade')", curVer, rel.TagName)
+		s.writeJobStatus("failed", err.Error(), rel.TagName)
+		return "", "", 0, err
+	}
+
 	archiveName := fmt.Sprintf("da-resource-limiter-linux-%s.tar.gz", s.Arch)
-	var archiveAsset, checksumAsset, sigAsset *githubAsset
+	var archiveAsset, checksumAsset, sigAsset, manifestAsset *githubAsset
 	for i := range rel.Assets {
 		a := &rel.Assets[i]
 		switch a.Name {
@@ -249,6 +266,8 @@ func (s *Service) stageReleaseLocked(ctx context.Context, targetVersion string) 
 			checksumAsset = a
 		case "checksums.txt.sig":
 			sigAsset = a
+		case "manifest.json":
+			manifestAsset = a
 		}
 	}
 	if archiveAsset == nil {
@@ -307,6 +326,30 @@ func (s *Service) stageReleaseLocked(ctx context.Context, targetVersion string) 
 		}
 	}
 
+	if manifestAsset != nil {
+		if manifestExpectedSHA, mLookupErr := lookupChecksum(checksumPath, "manifest.json"); mLookupErr == nil {
+			manifestPath := filepath.Join(stageDir, "release-manifest.json")
+			if err = s.downloadAsset(ctx, cfg, *manifestAsset, manifestPath); err != nil {
+				s.writeJobStatus("failed", "Download manifest.json failed: "+err.Error(), rel.TagName)
+				return "", "", 0, err
+			}
+			manifestActualSHA, shaErr := computeFileSHA256(manifestPath)
+			if shaErr != nil {
+				err = shaErr
+				return "", "", 0, err
+			}
+			if !strings.EqualFold(manifestActualSHA, manifestExpectedSHA) {
+				err = fmt.Errorf("SHA-256 verification failed for manifest.json: expected %s, got %s", manifestExpectedSHA, manifestActualSHA)
+				s.writeJobStatus("failed", err.Error(), rel.TagName)
+				return "", "", 0, err
+			}
+			if err = verifyManifestVersionFile(manifestPath, rel.TagName, ""); err != nil {
+				s.writeJobStatus("failed", err.Error(), rel.TagName)
+				return "", "", 0, err
+			}
+		}
+	}
+
 	expectedSHA, err := lookupChecksum(checksumPath, archiveName)
 	if err != nil {
 		s.writeJobStatus("failed", err.Error(), rel.TagName)
@@ -341,7 +384,68 @@ func (s *Service) stageReleaseLocked(ctx context.Context, targetVersion string) 
 		pkgRoot = unpackDir
 	}
 
+	// Verify extracted package metadata matches the requested release tag to defeat signed-old-archive replay (N13).
+	if err = verifyExtractedPackageVersion(pkgRoot, rel.TagName, s.Arch); err != nil {
+		s.writeJobStatus("failed", err.Error(), rel.TagName)
+		return "", "", 0, err
+	}
+
 	return pkgRoot, rel.TagName, cfg.BackupRetention, nil
+}
+
+type releaseManifest struct {
+	Version string `json:"version"`
+	Arch    string `json:"arch"`
+}
+
+func normalizeVersionBare(v string) string {
+	s := strings.TrimSpace(v)
+	s = strings.TrimPrefix(s, "v")
+	s = strings.TrimPrefix(s, "V")
+	return s
+}
+
+func verifyManifestVersionFile(manifestPath, expectedTag, expectedArch string) error {
+	raw, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return err
+	}
+	var m releaseManifest
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return fmt.Errorf("invalid manifest.json: %w", err)
+	}
+	if normalizeVersionBare(m.Version) == "" || normalizeVersionBare(m.Version) != normalizeVersionBare(expectedTag) {
+		return fmt.Errorf("release tag mismatch: manifest.json declares %q, expected release tag %q (refusing replayed archive)", m.Version, expectedTag)
+	}
+	if expectedArch != "" && strings.TrimSpace(m.Arch) != "" && strings.TrimSpace(m.Arch) != expectedArch {
+		return fmt.Errorf("release arch mismatch: manifest.json declares %q, expected %q", m.Arch, expectedArch)
+	}
+	return nil
+}
+
+func verifyExtractedPackageVersion(pkgRoot, expectedTag, expectedArch string) error {
+	expectedBare := normalizeVersionBare(expectedTag)
+	if expectedBare == "" {
+		return fmt.Errorf("invalid expected release tag %q", expectedTag)
+	}
+
+	manifestPath := filepath.Join(pkgRoot, "manifest.json")
+	if _, err := os.Stat(manifestPath); err == nil {
+		if err := verifyManifestVersionFile(manifestPath, expectedTag, expectedArch); err != nil {
+			return err
+		}
+	}
+
+	pluginConfPath := filepath.Join(pkgRoot, "plugin", "plugin.conf")
+	kv, err := config.ParseKeyValueFile(pluginConfPath)
+	if err != nil {
+		return fmt.Errorf("extracted archive missing valid plugin/plugin.conf: %w", err)
+	}
+	pluginVer := normalizeVersionBare(kv["version"])
+	if pluginVer == "" || pluginVer != expectedBare {
+		return fmt.Errorf("release tag mismatch: extracted plugin/plugin.conf declares version=%q, expected %q (refusing replayed archive)", kv["version"], expectedBare)
+	}
+	return nil
 }
 
 // TriggerUpdate stages the verified GitHub Release and launches scripts/update.sh in an independent transient systemd unit.
@@ -352,7 +456,7 @@ func (s *Service) TriggerUpdate(ctx context.Context, targetVersion string) (stri
 	}
 	defer releaseOp()
 
-	pkgRoot, resolvedTag, retention, err := s.stageReleaseLocked(ctx, targetVersion)
+	pkgRoot, resolvedTag, retention, err := s.stageReleaseLocked(ctx, targetVersion, false)
 	if err != nil {
 		return "", err
 	}
@@ -395,13 +499,18 @@ func (s *Service) TriggerRollback(_ context.Context) (string, error) {
 
 // RunCLIUpdate performs a synchronous update directly in the caller's terminal (for `da-resourced update`).
 func (s *Service) RunCLIUpdate(ctx context.Context, targetVersion string) error {
+	return s.RunCLIUpdateWithOptions(ctx, targetVersion, false)
+}
+
+// RunCLIUpdateWithOptions performs a synchronous CLI update with an optional downgrade override flag (N13).
+func (s *Service) RunCLIUpdateWithOptions(ctx context.Context, targetVersion string, allowDowngrade bool) error {
 	releaseOp, err := s.acquireUpdateOp()
 	if err != nil {
 		return err
 	}
 	defer releaseOp()
 
-	pkgRoot, resolvedTag, retention, err := s.stageReleaseLocked(ctx, targetVersion)
+	pkgRoot, resolvedTag, retention, err := s.stageReleaseLocked(ctx, targetVersion, allowDowngrade)
 	if err != nil {
 		return err
 	}

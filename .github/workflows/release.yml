@@ -46,8 +46,14 @@ jobs:
       - name: Run formatting, static analysis & race unit test suite
         run: |
           set -euo pipefail
-          if grep -rnU $'\r' scripts/ plugin/ systemd/ Makefile 2>/dev/null; then
+          if grep -rnU $'\r' scripts/ plugin/ systemd/ Makefile .github/workflows/ 2>/dev/null; then
             echo "Error: CRLF line endings detected!"
+            exit 1
+          fi
+          INSTALL_PUB="$(sed -n 's/^PINNED_ED25519_PUBKEY_HEX="\([^"]*\)".*/\1/p' scripts/install.sh | head -n 1)"
+          GO_PUB="$(sed -n 's/.*DefaultReleasePublicKeyHex[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' internal/version/version.go | head -n 1)"
+          if [[ -z "$INSTALL_PUB" || "$INSTALL_PUB" != "$GO_PUB" ]]; then
+            echo "Error: Ed25519 public key mismatch between scripts/install.sh and internal/version/version.go!"
             exit 1
           fi
           test -z "$(gofmt -l .)"
@@ -111,12 +117,13 @@ jobs:
           )
           cat release_out/checksums.txt
 
-          if [[ -n "${RELEASE_SIGNING_PRIVATE_KEY:-}" ]]; then
-            ./release_stage_amd64/da-resource-limiter/bin/da-resourced sign release_out/checksums.txt
-            ./release_stage_amd64/da-resource-limiter/bin/da-resourced verify release_out/checksums.txt release_out/checksums.txt.sig
-          else
-            echo "::warning::Secret RELEASE_SIGNING_PRIVATE_KEY is not configured; checksums.txt.sig was not generated automatically. Upload checksums.txt.sig or configure RELEASE_SIGNING_PRIVATE_KEY in Repository Secrets for Ed25519 self-updates."
+          if [[ -z "${RELEASE_SIGNING_PRIVATE_KEY:-}" ]]; then
+            echo "::error::Secret RELEASE_SIGNING_PRIVATE_KEY is required for Ed25519 release signing (N1). Refusing unsigned release."
+            exit 1
           fi
+          ./release_stage_amd64/da-resource-limiter/bin/da-resourced sign release_out/checksums.txt
+          test -s release_out/checksums.txt.sig
+          ./release_stage_amd64/da-resource-limiter/bin/da-resourced verify release_out/checksums.txt release_out/checksums.txt.sig
 
       - name: Upload verified release artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -150,10 +157,14 @@ jobs:
             release_out/da-resource-limiter-linux-arm64.tar.gz
             release_out/manifest.json
             release_out/checksums.txt
+            release_out/checksums.txt.sig
           )
-          if [[ -f release_out/checksums.txt.sig ]]; then
-            ASSETS+=(release_out/checksums.txt.sig)
-          fi
+          for asset in "${ASSETS[@]}"; do
+            if [[ ! -s "$asset" ]]; then
+              echo "::error::Required release asset is missing or empty: $asset"
+              exit 1
+            fi
+          done
           ARGS=(
             "$TAG"
             "${ASSETS[@]}"

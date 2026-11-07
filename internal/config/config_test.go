@@ -184,3 +184,49 @@ func TestIdentifierValidationBlocksTraversal(t *testing.T) {
 		}
 	}
 }
+
+func TestClampPenaltyUpperBoundsDisabledSaveAndLargeKVLine(t *testing.T) {
+	tmp := t.TempDir()
+	store := NewStore(tmp, "")
+
+	// 1. N3: Legacy/strict package with MYSQL_MAX_CONNECTIONS=1 while default.conf has MYSQL_PENALTY_CONN=2
+	// must clamp penalty ceiling down to 1 instead of breaking ResolveUserLimits / ApplyUser.
+	if err := os.WriteFile(store.DefaultConfPath(), []byte("ENABLED=yes\nMYSQL_MAX_CONNECTIONS=1\nMYSQL_PENALTY_CONN=2\nMYSQL_MAX_STATEMENT_TIME_SEC=1\nMYSQL_PENALTY_TIME_SEC=2\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := store.ResolveUserLimits("alice", "")
+	if err != nil {
+		t.Fatalf("expected ClampPenaltyUpperBounds to resolve cleanly (N3), got err=%v", err)
+	}
+	if resolved.MySQLPenaltyConn != 1 || resolved.MySQLPenaltyTimeSec != 1 {
+		t.Fatalf("expected penalty conn/time clamped to 1/1, got conn=%d time=%d", resolved.MySQLPenaltyConn, resolved.MySQLPenaltyTimeSec)
+	}
+
+	if err := store.MigrateDefaultKeys(); err != nil {
+		t.Fatalf("MigrateDefaultKeys on legacy low-ceiling default.conf: %v", err)
+	}
+
+	// 2. N3: Saving ENABLED=no must succeed even if MySQL fields on the form are 0 or unconfigured.
+	disabled := ResourceLimits{
+		Enabled:             false,
+		MySQLMaxConnections: 0,
+		MySQLPenaltyConn:    5,
+	}
+	if err := store.SaveUserLimits("alice", disabled); err != nil {
+		t.Fatalf("expected SaveUserLimits with ENABLED=no to succeed (N3), got: %v", err)
+	}
+
+	// 3. N2: ParseKeyValueFile handles lines > 64 KB (up to 1 MB) without bufio.Scanner ErrTooLong.
+	hugePath := filepath.Join(tmp, "huge_user.conf")
+	hugeVal := strings.Repeat("d", 120*1024)
+	if err := os.WriteFile(hugePath, []byte("domains="+hugeVal+"\nusertype=user\npackage=vip\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	kv, err := ParseKeyValueFile(hugePath)
+	if err != nil {
+		t.Fatalf("ParseKeyValueFile >64KB line failed (N2): %v", err)
+	}
+	if kv["package"] != "vip" || len(kv["domains"]) != len(hugeVal) {
+		t.Fatalf("unexpected parsed huge_user.conf: pkg=%q len(domains)=%d", kv["package"], len(kv["domains"]))
+	}
+}

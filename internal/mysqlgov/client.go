@@ -20,6 +20,7 @@ const (
 	DefaultDAMySQLConf  = "/usr/local/directadmin/conf/mysql.conf"
 	DefaultRuntimeCnf   = "/run/da-resourced/mysql-client.cnf"
 	DefaultQueryTimeout = 5 * time.Second
+	DefaultBatchTimeout = 30 * time.Second
 )
 
 // SQLRunner abstracts SQL query and batch execution so MariaDB Governor logic is 100% unit-testable.
@@ -36,6 +37,7 @@ type CLIMySQLRunner struct {
 	DAMySQLConf   string
 	RuntimeCnf    string
 	QueryTimeout  time.Duration
+	BatchTimeout  time.Duration
 	mu            sync.Mutex
 	preparedExtra string
 }
@@ -56,6 +58,7 @@ func NewCLIMySQLRunner(daMyCnfPath, daMySQLConf, runtimeCnf string) *CLIMySQLRun
 		DAMySQLConf:  daMySQLConf,
 		RuntimeCnf:   runtimeCnf,
 		QueryTimeout: DefaultQueryTimeout,
+		BatchTimeout: DefaultBatchTimeout,
 	}
 }
 
@@ -181,10 +184,70 @@ func (c *CLIMySQLRunner) QueryTSV(ctx context.Context, sql string) ([]string, er
 	return strings.Split(raw, "\n"), nil
 }
 
+// ExecBatch executes multi-statement administrative batches (ALTER USER + FLUSH USER_RESOURCES or KILL QUERY)
+// with --force so a single vanished user (ERROR 1396) or finished query (ERROR 1094) never aborts the
+// remaining statements in the batch (N4), and uses BatchTimeout so large batches do not hit the 5s read timeout (N5).
 func (c *CLIMySQLRunner) ExecBatch(ctx context.Context, sql string) error {
 	if strings.TrimSpace(sql) == "" {
 		return nil
 	}
-	_, err := c.QueryTSV(ctx, sql)
-	return err
+	extraFile, err := c.ensureDefaultsFile()
+	if err != nil {
+		return err
+	}
+
+	timeout := c.BatchTimeout
+	if timeout <= 0 {
+		timeout = DefaultBatchTimeout
+	}
+	bCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	args := []string{
+		"--defaults-extra-file=" + extraFile,
+		"--connect-timeout=3",
+		"--batch",
+		"--skip-column-names",
+		"--force",
+	}
+	cmd := exec.CommandContext(bCtx, c.MySQLBin, args...)
+	cmd.Stdin = strings.NewReader(sql)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	runErr := cmd.Run()
+	nonBenignErrs, sawOnlyBenign := classifyMySQLBatchStderr(stderr.String())
+
+	if runErr != nil {
+		if bCtx.Err() == nil && sawOnlyBenign {
+			return nil
+		}
+		if len(nonBenignErrs) > 0 {
+			return fmt.Errorf("mysql batch failed: %w (%s)", runErr, strings.Join(nonBenignErrs, "; "))
+		}
+		return fmt.Errorf("mysql batch failed: %w (%s)", runErr, strings.TrimSpace(stderr.String()))
+	}
+	if len(nonBenignErrs) > 0 {
+		return fmt.Errorf("mysql batch completed with %d statement error(s): %s", len(nonBenignErrs), strings.Join(nonBenignErrs, "; "))
+	}
+	return nil
+}
+
+func classifyMySQLBatchStderr(raw string) (nonBenign []string, sawOnlyBenign bool) {
+	sawBenign := false
+	for _, line := range strings.Split(raw, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		// ERROR 1094 (HY000): Unknown thread id — benign race when a query finishes right before KILL QUERY runs.
+		if strings.Contains(trimmed, "ERROR 1094 ") || strings.Contains(trimmed, "ERROR 1094:") || strings.Contains(strings.ToLower(trimmed), "unknown thread id") {
+			sawBenign = true
+			continue
+		}
+		nonBenign = append(nonBenign, trimmed)
+	}
+	return nonBenign, sawBenign && len(nonBenign) == 0
 }
